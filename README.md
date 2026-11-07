@@ -9,7 +9,7 @@
 一款专注于数字高程模型（DEM）的 Windows 桌面渲染工具。  
 用直观的工作区塑造地形、调整光影，并将成果输出为高分辨率图像或带地理参考的 GeoTIFF。
 
-![DEMStudio 工作区](assets/readme/hero.png)
+![DEMStudio 工作区](https://raw.githubusercontent.com/SpDDoggy/DEMStudio/92e6cff89cfe862cc178805eafde74578e0d5e04/assets/readme/hero.png)
 
 `Windows` · `Rust` · `Tauri 2` · `OpenGL` · `GLSL` · `v0.0.1`
 
