@@ -1,0 +1,14 @@
+/src-tauri/target/
+/src-tauri/gen/
+/build/
+/work/
+/docs/
+/tests/
+/test-data/
+/.ack/
+/.vscode/
+.env
+.env.*
+*.exe
+*.dll
+*.pdb
