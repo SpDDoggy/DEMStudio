@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod renderer;
+mod sidecar;
 use renderer::{native::RendererHandle, RenderParams, RenderStatus, ViewportRect};
 use serde::Serialize;
 use std::{
@@ -21,6 +22,10 @@ fn handle(state: &Runtime) -> Result<RendererHandle, String> {
         .ok_or("渲染器尚未初始化".into())
 }
 fn validate(p: &RenderParams) -> Result<(), String> {
+    if !["source", "half", "quarter", "preview"].contains(&p.export_terrain_scale.as_str()) {
+        return Err("无效的导出地形精度".into());
+    }
+    if !matches!(p.output_bit_depth, 8 | 16) { return Err("输出位深仅支持8或16".into()); }
     for value in [p.texture_exposure, p.scene_exposure] {
         if !value.is_finite() || !(-4. ..=4.).contains(&value) {
             return Err("曝光应在-4至4 EV之间".into());
@@ -58,6 +63,7 @@ fn validate(p: &RenderParams) -> Result<(), String> {
         p.gamma,
         p.bloom,
         p.height_scale,
+        p.height_curve,
         p.height_offset,
         p.height_step,
     ];
@@ -77,18 +83,24 @@ fn validate(p: &RenderParams) -> Result<(), String> {
         || p.field_of_view <= 0.
         || p.field_of_view >= 175.
         || p.height_scale <= 0.
+        || !["linear", "accelerated", "nonlinear"].contains(&p.height_scale_mode.as_str())
+        || !(0.01..=1000.).contains(&p.height_curve)
+        || (p.height_scale_mode != "nonlinear" && p.height_curve != 1.)
         || !(0. ..=100.).contains(&p.height_offset)
         || p.sun_size <= 0.
         || !(0. ..=90.).contains(&p.sun_altitude)
         || p.height_step < 0.
         || p.sun_intensity < 0.
         || p.sky_intensity < 0.
+        || !["constant", "atmosphere"].contains(&p.sky_model.as_str())
+        || !(1..=if p.experimental_bounces {100} else {15}).contains(&p.max_bounces)
         || p.exposure < 0.
         || !p.shadow_padding.is_finite()
         || !(1. ..=200.).contains(&p.shadow_padding)
     {
         return Err("渲染参数超出有效范围".into());
     }
+    renderer::gl_renderer::validate_contour_parameters(p)?;
     for adjustment in [
         p.output_contrast,
         p.output_saturation,
@@ -200,7 +212,7 @@ fn renderer_status(state: tauri::State<Runtime>) -> Result<RenderStatus, String>
     Ok(handle(&state)?.status())
 }
 #[tauri::command]
-async fn renderer_import(state: tauri::State<'_, Runtime>) -> Result<Option<RenderStatus>, String> {
+async fn renderer_import(state: tauri::State<'_, Runtime>, sidecars: tauri::State<'_, sidecar::SidecarIo>) -> Result<Option<RenderStatus>, String> {
     let h = handle(&state)?;
     let Some(file) = rfd::AsyncFileDialog::new()
         .add_filter("Heightmap", &["jpg", "jpeg", "png", "tif", "tiff", "asc"])
@@ -213,8 +225,26 @@ async fn renderer_import(state: tauri::State<'_, Runtime>) -> Result<Option<Rend
     let map = tauri::async_runtime::spawn_blocking(move || renderer::heightmap::load(&path))
         .await
         .map_err(|e| e.to_string())??;
+    let initial_height_scale=renderer::initial_height_scale(&map);
+    let _sidecar_guard=sidecars.0.lock().map_err(|e|e.to_string())?;
     h.set_map(map)?;
-    Ok(Some(h.status()))
+    let mut result=h.status();
+    result.initial_height_scale=initial_height_scale;
+    Ok(Some(result))
+}
+#[tauri::command]
+fn source_settings_load(path:String,state:tauri::State<Runtime>,sidecars:tauri::State<sidecar::SidecarIo>)->Result<Option<serde_json::Value>,String>{
+    let _guard=sidecars.0.lock().map_err(|e|e.to_string())?;
+    let source=handle(&state)?.status().source;
+    let target=sidecar::checked_path(source.as_ref().map(|s|s.path.as_path()),&path)?;
+    sidecar::load(&target)
+}
+#[tauri::command]
+fn source_settings_save(path:String,document:serde_json::Value,state:tauri::State<Runtime>,sidecars:tauri::State<sidecar::SidecarIo>)->Result<(),String>{
+    let _guard=sidecars.0.lock().map_err(|e|e.to_string())?;
+    let source=handle(&state)?.status().source;
+    let target=sidecar::checked_path(source.as_ref().map(|s|s.path.as_path()),&path)?;
+    sidecar::save(&target,document)
 }
 #[tauri::command]
 async fn renderer_import_texture(
@@ -392,6 +422,7 @@ fn main() {
     tauri::Builder::default()
         .manage(Runtime::default())
         .manage(ExportResultPath::default())
+        .manage(sidecar::SidecarIo::default())
         .invoke_handler(tauri::generate_handler![
             app_info,
             ui_ready,
@@ -401,6 +432,8 @@ fn main() {
             renderer_pause,
             renderer_status,
             renderer_import,
+            source_settings_load,
+            source_settings_save,
             renderer_import_texture,
             renderer_remove_texture,
             renderer_preview,
@@ -413,7 +446,7 @@ fn main() {
         .on_window_event(|window, event| {
             if matches!(
                 event,
-                tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+                tauri::WindowEvent::Destroyed
             ) {
                 if let Ok(h) = handle(&window.state::<Runtime>()) {
                     h.shutdown();

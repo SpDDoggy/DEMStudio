@@ -7,6 +7,12 @@ pub mod heightmap;
 pub mod native;
 pub mod png_output;
 pub mod raster;
+mod sky;
+mod tiff_stream;
+mod source_grid;
+mod paged_source;
+mod paged_shader;
+mod resident_shader;
 pub mod thumbnail;
 
 use serde::{Deserialize, Serialize};
@@ -20,10 +26,19 @@ pub struct HeightMap {
     pub values: Vec<f32>,
     /// Source-wide range in values units, never recomputed from a preview.
     pub display_range: [f32; 2],
+    /// Source-value extrema, independent of preview sampling and legacy geometry units.
+    pub source_elevation_range: Option<[f64; 2]>,
     pub bottom: f32,
     pub span: f32,
     pub name: String,
     pub source: Option<raster::RasterSource>,
+}
+
+pub fn initial_height_scale(map: &HeightMap) -> Option<f32> {
+    let path=map.source.as_ref().map(|s| s.path.as_path())
+        .unwrap_or_else(|| std::path::Path::new(&map.name));
+    let extension=path.extension()?.to_str()?;
+    (extension.eq_ignore_ascii_case("tif") || extension.eq_ignore_ascii_case("tiff")).then_some(0.2)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -36,6 +51,9 @@ pub struct RenderParams {
     pub sun_color: String,
     pub sky_intensity: f32,
     pub sky_color: String,
+    pub sky_model: String,
+    pub max_bounces: u32,
+    pub experimental_bounces: bool,
     pub fog_density: f32,
     pub camera_yaw: f32,
     pub camera_pitch: f32,
@@ -68,8 +86,18 @@ pub struct RenderParams {
     pub stretch_deviations: f32,
     pub stretch_low: f32,
     pub stretch_high: f32,
+    pub contour_enabled: bool,
+    pub contour_interval: f32,
+    pub contour_width: f32,
+    pub contour_smoothing: f32,
+    pub contour_color: String,
+    pub contour_opacity: f32,
+    pub contour_major_every: u32,
+    pub contour_major_width: f32,
     pub elevation_blend: String,
     pub height_scale: f32,
+    pub height_scale_mode: String,
+    pub height_curve: f32,
     pub height_offset: f32,
     pub height_step: f32,
     pub lod: i32,
@@ -85,6 +113,9 @@ pub struct RenderParams {
     pub width: u32,
     pub height: u32,
     pub samples: u32,
+    pub output_bit_depth: u8,
+    /// Axial terrain sample resolution; independent of output image dimensions.
+    pub export_terrain_scale: String,
     pub projection: String,
     pub grid: bool,
     pub export_shadow: bool,
@@ -100,8 +131,11 @@ impl Default for RenderParams {
             sun_size: 1.,
             sun_intensity: 100.,
             sun_color: "#fff1db".into(),
-            sky_intensity: 100.,
+            sky_intensity: 45.,
             sky_color: "#a9c9e8".into(),
+            sky_model: "atmosphere".into(),
+            max_bounces: 8,
+            experimental_bounces: false,
             fog_density: 0.,
             camera_yaw: 45.,
             camera_pitch: 35.,
@@ -133,8 +167,18 @@ impl Default for RenderParams {
             stretch_deviations: 2.,
             stretch_low: 2.,
             stretch_high: 2.,
+            contour_enabled: false,
+            contour_interval: 5.,
+            contour_width: 0.65,
+            contour_smoothing: 1.,
+            contour_color: "#6b6258".into(),
+            contour_opacity: 45.,
+            contour_major_every: 5,
+            contour_major_width: 1.1,
             elevation_blend: "color".into(),
             height_scale: 1.,
+            height_scale_mode: "linear".into(),
+            height_curve: 1.,
             height_offset: 0.,
             height_step: 0.,
             lod: 0,
@@ -150,6 +194,8 @@ impl Default for RenderParams {
             width: 1920,
             height: 1080,
             samples: 256,
+            output_bit_depth: 8,
+            export_terrain_scale: "source".into(),
             projection: "perspective".into(),
             grid: true,
             export_shadow: false,
@@ -182,6 +228,8 @@ pub struct ViewportRect {
 #[derive(Clone, Serialize, Default, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct RenderStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_height_scale: Option<f32>,
     pub ready: bool,
     pub paused: bool,
     pub samples: u32,
@@ -197,6 +245,8 @@ pub struct RenderStatus {
     pub source: Option<raster::RasterSource>,
     pub exporting: bool,
     pub export_progress: u32,
+    /// Actual rendered pixel-samples, independent of preparation progress.
+    pub export_work_progress: Option<f64>,
     pub gl_renderer: String,
     pub gl_version: String,
     pub error: Option<String>,

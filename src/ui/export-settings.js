@@ -1,6 +1,6 @@
 export const stretchKeys = ['stretchType', 'stretchDeviations', 'stretchLow', 'stretchHigh'];
 
-export const exportKeys = new Set(['width', 'height', 'samples', 'exposure', 'gamma',
+export const exportKeys = new Set(['width', 'height', 'samples', 'outputBitDepth', 'exportTerrainScale', 'exposure', 'gamma',
   'exportOrthographic', 'outputContrast', 'outputSaturation', 'outputTemperature', 'outputShadows', 'outputHighlights', 'exportShadow', 'shadowPadding']);
 
 export function createExportSettings(parameters) {
@@ -8,7 +8,7 @@ export function createExportSettings(parameters) {
 }
 
 export function exportSnapshot(parameters, settings) {
-  return cloneScene({ ...parameters, ...settings, grid: false,
+  return cloneScene({ ...parameters, ...settings, grid: false, contourEnabled: false,
     exposure: 1, gamma: 2.2, outputContrast: 0, outputSaturation: 0,
     outputTemperature: 0, outputShadows: 0, outputHighlights: 0 });
 }

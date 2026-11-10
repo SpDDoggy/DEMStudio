@@ -1,4 +1,5 @@
-//! Source-grid orthographic output. The callback returns top-to-bottom RGBA8 rows.
+//! Source-grid orthographic output. Callbacks return top-to-bottom straight RGBA.
+//! RGBA16 samples use native endian; TIFF serializes values in its declared byte order.
 //! Streaming strips intentionally use no compression: tiff 0.11's public
 //! `write_strip` does not activate the compressor used by `write_data`.
 
@@ -10,7 +11,10 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 use tiff::{
-    encoder::{colortype::RGBA8, TiffEncoder, TiffKind},
+    encoder::{
+        colortype::{ColorType, RGBA16, RGBA8},
+        TiffEncoder, TiffKind,
+    },
     tags::Tag,
 };
 
@@ -47,6 +51,24 @@ pub fn write_orthographic_extent<F>(
 where
     F: FnMut(u32, u32, u32, u32) -> Result<Vec<u8>, String>,
 {
+    write_orthographic_extent_depth(path, source, width, height, left, top, 8, render_tile)
+}
+
+/// RGBA16 tiles contain native-endian u16 values, including straight alpha.
+pub fn write_orthographic_extent_depth<F>(
+    path: &Path,
+    source: &RasterSource,
+    width: u32,
+    height: u32,
+    left: u32,
+    top: u32,
+    depth: u8,
+    render_tile: F,
+) -> Result<(), String>
+where
+    F: FnMut(u32, u32, u32, u32) -> Result<Vec<u8>, String>,
+{
+    validate_depth(depth)?;
     if left.checked_add(source.width).is_none_or(|w| w > width)
         || top.checked_add(source.height).is_none_or(|h| h > height)
     {
@@ -57,7 +79,7 @@ where
         .as_ref()
         .ok_or("源图像没有地理坐标，无法导出带坐标系的 TIFF")?;
     let shifted = geo.shifted_pixels(-i64::from(left), -i64::from(top))?;
-    write_grid(path, width, height, &shifted, render_tile)
+    write_grid_depth(path, width, height, &shifted, depth, render_tile)
 }
 
 struct PendingFile(PathBuf);
@@ -137,26 +159,45 @@ fn matrix(geo: &GeoReference) -> [f64; 16] {
     ]
 }
 
-fn strip_layout(width: u32, height: u32) -> Result<(usize, u32), String> {
+fn validate_depth(depth: u8) -> Result<usize, String> {
+    match depth {
+        8 => Ok(1),
+        16 => Ok(2),
+        _ => Err("TIFF 位深必须为 8 或 16".into()),
+    }
+}
+
+
+fn strip_layout_depth(width: u32, height: u32, depth: u8) -> Result<(usize, u32), String> {
+    let sample_bytes = validate_depth(depth)?;
     if width == 0 || height == 0 {
         return Err("正射 TIFF 尺寸必须大于零".into());
     }
     let row_bytes = usize::try_from(width)
         .ok()
-        .and_then(|w| w.checked_mul(4))
+        .and_then(|w| w.checked_mul(4 * sample_bytes))
         .filter(|bytes| *bytes <= MAX_STRIP_BYTES)
         .ok_or("正射 TIFF 单行大小超过条带内存限制")?;
     let rows = STRIP_HEIGHT
         .min((MAX_STRIP_BYTES / row_bytes) as u32)
         .max(1);
+    // Keep derivative quads aligned between strips for screen-space contours.
+    let rows=if rows>1 {rows & !1} else {1};
     Ok((row_bytes, rows))
 }
 
-fn requires_bigtiff(width: u32, height: u32, geo: &GeoReference) -> Result<bool, String> {
-    let (_, rows) = strip_layout(width, height)?;
+
+fn requires_bigtiff_depth(
+    width: u32,
+    height: u32,
+    geo: &GeoReference,
+    depth: u8,
+) -> Result<bool, String> {
+    let sample_bytes = validate_depth(depth)?;
+    let (_, rows) = strip_layout_depth(width, height, depth)?;
     let payload = u64::from(width)
         .checked_mul(u64::from(height))
-        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|pixels| pixels.checked_mul(4 * sample_bytes as u64))
         .ok_or("正射 TIFF 文件大小超出限制")?;
     // Reserve directory/tag payload, strip offsets/counts and alignment before choosing classic TIFF.
     let metadata = 65_536u64
@@ -170,30 +211,50 @@ fn requires_bigtiff(width: u32, height: u32, geo: &GeoReference) -> Result<bool,
         > u64::from(u32::MAX))
 }
 
-fn write_grid<F>(
+
+fn write_grid_depth<F>(
     path: &Path,
     width: u32,
     height: u32,
     geo: &GeoReference,
+    depth: u8,
     mut render_tile: F,
 ) -> Result<(), String>
 where
     F: FnMut(u32, u32, u32, u32) -> Result<Vec<u8>, String>,
 {
-    let (_, rows) = strip_layout(width, height)?;
+    let (_, rows) = strip_layout_depth(width, height, depth)?;
     if !geo.valid() {
         return Err("地理仿射变换无效".into());
     }
     let keys = area_keys(geo)?;
-    let big = requires_bigtiff(width, height, geo)?;
+    let big = requires_bigtiff_depth(width, height, geo, depth)?;
     let (pending, file) = temporary_file(path)?;
     let mut writer = BufWriter::new(file);
     if big {
         let mut tiff = TiffEncoder::new_big(&mut writer).map_err(|e| e.to_string())?;
-        encode_grid(&mut tiff, width, height, rows, geo, &keys, &mut render_tile)?;
+        encode_grid_depth(
+            &mut tiff,
+            width,
+            height,
+            rows,
+            geo,
+            &keys,
+            depth,
+            &mut render_tile,
+        )?;
     } else {
         let mut tiff = TiffEncoder::new(&mut writer).map_err(|e| e.to_string())?;
-        encode_grid(&mut tiff, width, height, rows, geo, &keys, &mut render_tile)?;
+        encode_grid_depth(
+            &mut tiff,
+            width,
+            height,
+            rows,
+            geo,
+            &keys,
+            depth,
+            &mut render_tile,
+        )?;
     }
     writer
         .flush()
@@ -207,7 +268,45 @@ where
     Ok(())
 }
 
-fn encode_grid<W: Write + Seek, K: TiffKind, F>(
+
+fn encode_grid_depth<W: Write + Seek, K: TiffKind, F>(
+    tiff: &mut TiffEncoder<W, K>,
+    width: u32,
+    height: u32,
+    rows: u32,
+    geo: &GeoReference,
+    keys: &[u16],
+    depth: u8,
+    render_tile: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(u32, u32, u32, u32) -> Result<Vec<u8>, String>,
+{
+    match depth {
+        8 => encode_grid_samples::<W, K, F, RGBA8>(
+            tiff,
+            width,
+            height,
+            rows,
+            geo,
+            keys,
+            render_tile,
+            |b| b[0],
+        ),
+        16 => encode_grid_samples::<W, K, F, RGBA16>(
+            tiff,
+            width,
+            height,
+            rows,
+            geo,
+            keys,
+            render_tile,
+            |b| u16::from_ne_bytes([b[0], b[1]]),
+        ),
+        _ => Err("TIFF 位深必须为 8 或 16".into()),
+    }
+}
+fn encode_grid_samples<W: Write + Seek, K: TiffKind, F, C: ColorType>(
     tiff: &mut TiffEncoder<W, K>,
     width: u32,
     height: u32,
@@ -215,15 +314,21 @@ fn encode_grid<W: Write + Seek, K: TiffKind, F>(
     geo: &GeoReference,
     keys: &[u16],
     render_tile: &mut F,
+    convert: fn(&[u8]) -> C::Inner,
 ) -> Result<(), String>
 where
     F: FnMut(u32, u32, u32, u32) -> Result<Vec<u8>, String>,
+    C::Inner: Copy + Default,
+    [C::Inner]: tiff::encoder::TiffValue,
 {
+    let sample_bytes = std::mem::size_of::<C::Inner>();
     let mut image = tiff
-        .new_image::<RGBA8>(width, height)
+        .new_image::<C>(width, height)
         .map_err(|e| e.to_string())?;
     image.rows_per_strip(rows).map_err(|e| e.to_string())?;
     let dir = image.encoder();
+    dir.write_tag(Tag::Unknown(34675), &include_bytes!("srgb.icc")[..])
+        .map_err(|e| e.to_string())?;
     dir.write_tag(Tag::Orientation, 1u16)
         .map_err(|e| e.to_string())?;
     dir.write_tag(Tag::ExtraSamples, &[2u16][..])
@@ -240,21 +345,25 @@ where
         dir.write_tag(Tag::GeoAsciiParamsTag, geo.ascii.as_str())
             .map_err(|e| e.to_string())?;
     }
-    let (row_bytes, _) = strip_layout(width, height)?;
+    let row_samples = width as usize * 4;
     for y in (0..height).step_by(rows as usize) {
         let h = rows.min(height - y);
-        let mut strip = vec![0u8; row_bytes * h as usize];
+        let mut strip = vec![C::Inner::default(); row_samples * h as usize];
         for x in (0..width).step_by(TILE_WIDTH as usize) {
             let w = TILE_WIDTH.min(width - x);
             let tile = render_tile(x, y, w, h)?;
-            let tile_row = w as usize * 4;
+            let tile_row = w as usize * 4 * sample_bytes;
             if tile.len() != tile_row * h as usize {
                 return Err(format!("正射渲染块 ({x}, {y}) 的像素数量不正确"));
             }
             for row in 0..h as usize {
-                let start = row * row_bytes + x as usize * 4;
-                strip[start..start + tile_row]
-                    .copy_from_slice(&tile[row * tile_row..(row + 1) * tile_row]);
+                let start = row * row_samples + x as usize * 4;
+                for (dst, bytes) in strip[start..start + w as usize * 4]
+                    .iter_mut()
+                    .zip(tile[row * tile_row..(row + 1) * tile_row].chunks_exact(sample_bytes))
+                {
+                    *dst = convert(bytes);
+                }
             }
         }
         image
@@ -264,5 +373,3 @@ where
     image.finish().map_err(|e| e.to_string())?;
     Ok(())
 }
-
-

@@ -749,6 +749,7 @@ dependencies = [
 name = "demstudio"
 version = "0.0.1"
 dependencies = [
+ "flate2",
  "glow",
  "image",
  "jpeg-decoder",
@@ -759,6 +760,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tiff",
+ "weezl",
  "windows",
 ]
 

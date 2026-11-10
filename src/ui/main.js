@@ -4,11 +4,15 @@ import { cameraPanDelta, nativePanPixels, resetCameraParameters } from './camera
 import { stretchKeys, exportKeys, createExportSettings, exportSnapshot, previewScale, sourceOutputSize, freezeCurrentView, viewOutputSize, proportionalSize, cloneScene } from './export-settings.js';
 import { enhanceSelects } from './combobox.js';
 import { createExportProgress } from './export-progress.js';
+import { createPresetStore, defaultPresetSettings, applyPresetSettings } from './render-presets.js';
+import { createSourceSettings, flushSettingsOnClose } from './source-settings.js';
+import { nativeHeightScaling } from './height-scaling.js';
+import { bounceLimit, switchSkyModel, toggleExperimentalBounces, acceptsExperimentalShortcut } from './lighting-controls.js';
 
 const estimateExportProgress = createExportProgress();
 let exportCommandPending = false;
 function updateExportProgress(status) {
-  const progress = estimateExportProgress(exportCommandPending && !!status?.exporting, status?.exportProgress, performance.now());
+  const progress = estimateExportProgress(exportCommandPending && !!status?.exporting, status?.exportProgress, performance.now(), status?.exportWorkProgress);
   document.querySelector('#export-job').hidden = !progress.visible;
   document.querySelector('#export-job-bar').value = progress.percent;
   document.querySelector('#export-job-percent').textContent = `${progress.percent}%`;
@@ -60,6 +64,7 @@ export function createLatestValueScheduler(send, {
 
 const scene = createSceneState();
 const exportSettings = createExportSettings(scene.parameters);
+let presetStretchScene = null;
 let exportSceneSnapshot = null;
 let exportViewport = null;
 let exportSourceStatus = null;
@@ -70,6 +75,8 @@ let rendererReady = false;
 let renderStatus = null;
 let lastError = '';
 let nativeDialogOpen = false;
+const sourceSettings = createSourceSettings({invoke:(...args)=>invoke(...args),getSettings:currentPresetSettings,applySettings:installRenderPreset,
+  onWarning:error=>console.warn('设置快照',error)});
 const sourceDetails = document.createElement('div');
 sourceDetails.id = 'source-details';
 sourceDetails.className = 'source-details';
@@ -81,7 +88,7 @@ const parameterUpdates = createLatestValueScheduler(
 );
 
 function rendererParams() {
-  return { ...scene.parameters, cameraPan: [...scene.parameters.cameraPan], ...nativeRamp(scene.parameters), surface: scene.parameters.surface === 'polygon' ? 'poly' : scene.parameters.surface };
+  return { ...scene.parameters, contourEnabled: false, ...nativeHeightScaling(scene.parameters), cameraPan: [...scene.parameters.cameraPan], ...nativeRamp(scene.parameters), surface: scene.parameters.surface === 'polygon' ? 'poly' : scene.parameters.surface };
 }
 
 window.__DEMSTUDIO_OVERLAYS__ = () => {
@@ -159,7 +166,7 @@ function applyStatus(status) {
   document.querySelector('#export-image').disabled = !status.ready || status.exporting;
   document.querySelector('#export-geotiff').disabled = !status.ready || status.exporting || !status.source?.geo?.keys?.length;
   document.querySelector('#cancel-export').hidden = !status.exporting;
-  document.querySelectorAll('[data-key],[role=tab],[data-mode],button[data-view],[data-appearance=material],[data-appearance=elevation],#reset-camera,#reset-grading,#toggle-grid').forEach(control => { control.disabled = !!status.exporting; });
+  document.querySelectorAll('[data-key],[role=tab],[data-mode],button[data-view],[data-appearance=material],[data-appearance=elevation],#reset-camera,#reset-grading,#toggle-grid,#render-preset,#preset-name,#save-preset,#apply-preset,#remove-preset,#reset-render').forEach(control => { control.disabled = !!status.exporting; });
   const source = status.source;
   sourceDetails.hidden = !source;
   if (source) {
@@ -188,6 +195,7 @@ function queueParameterUpdate() {
   renderCameraAxis();
   if (!rendererReady || renderStatus?.exporting || removingTexture) return;
   parameterUpdates.request(rendererParams());
+  sourceSettings.request();
   if (document.querySelector('#export-dialog').open) scheduleExportPreview();
 }
 
@@ -196,12 +204,19 @@ async function nativeFileCommand(command) {
   nativeDialogOpen = true;
   try {
     await flushParameterUpdate();
+    if (command === 'renderer_import') await sourceSettings.suspend();
     const exporting = command === 'renderer_export' || command === 'renderer_export_geotiff';
     exportCommandPending = exporting;
     if (exporting && typeof resetExportResult === 'function') resetExportResult();
     const result = await invoke(command, exporting ? { params: {...exportSnapshot(exportSceneSnapshot ?? rendererParams(), exportSettings), exportShadow: command === 'renderer_export_geotiff' && exportSettings.exportShadow} } : undefined);
     if (exporting && result) await showExportResult();
     if ((command === 'renderer_import' || command === 'renderer_import_texture') && result) applyStatus(result);
+    if (command === 'renderer_import' && Number.isFinite(result?.initialHeightScale)) {
+      scene.parameters.heightScale = normalizeParameter('heightScale', result.initialHeightScale * 5);
+      scene.parameters.heightScaleMode = 'linear';
+      render(); queueParameterUpdate();
+    }
+    if (command === 'renderer_import' && result) await sourceSettings.open(result.source?.path);
     if (command === 'renderer_import_texture' && result) {
       scene.parameters.appearanceMode = 'texture';
       render(); queueParameterUpdate();
@@ -209,6 +224,7 @@ async function nativeFileCommand(command) {
   } catch (error) { if (!/^已取消 (TIFF|PNG) 导出$/.test(error?.message ?? String(error))) await showError(error); }
   finally {
     nativeDialogOpen = false;
+    if (command === 'renderer_import') sourceSettings.resume();
     exportCommandPending = false;
     updateExportProgress(null);
   }
@@ -218,15 +234,14 @@ async function flushParameterUpdate() {
   if (rendererReady) await parameterUpdates.flush(rendererParams());
 }
 const groups = [
-  ['#map-fields', '地形', ['surface', 'heightScale', 'heightOffset', 'heightStep']],
-  ['#map-fields', '拉伸', stretchKeys],
-  ['#postprocess', '拉伸', stretchKeys],
+  ['#map-fields', '地形', ['surface', 'heightScaleMode', 'heightScale', 'heightOffset', 'heightStep']],
   ['#texture-fields', '贴图', ['textureOpacity']],
   ['#texture-fields', '处理', ['textureExposure', 'textureContrast', 'textureShadows', 'textureHighlights', 'textureSaturation']],
   ['#material-fields', '材质', ['materialColor', 'materialOpacity']],
   ['#elevation-fields', '赋色', ['rampInterpolation', 'colorRamp', 'elevationBlend', 'elevationOpacity']],
   ['#light', '太阳', ['sunAltitude', 'sunAzimuth', 'sunSize', 'sunIntensity', 'sunColor']],
-  ['#light', '天空', ['skyIntensity', 'skyColor']],
+  ['#light', '天空', ['skyModel', 'skyIntensity', 'skyColor']],
+  ['#light', '路径追踪', ['maxBounces']],
   ['#grading', '调色', sceneGradeKeys],
   ['#camera', '相机', ['cameraYaw', 'cameraPitch', 'cameraDistance', 'fieldOfView']],
   ['#output', '图像', ['width', 'height']],
@@ -242,8 +257,9 @@ function makeControl(key, type) {
   if (field.options) {
     for (const [value, text] of Object.entries(field.options)) input.add(new Option(text, value));
   } else {
-    input.type = type ?? field.type ?? 'number';
-    if (field.min !== undefined) Object.assign(input, { min: field.min, max: field.max, step: field.step });
+    input.type = field.type === 'boolean' ? 'checkbox' : type ?? field.type ?? 'number';
+    if (field.type === 'boolean') input.className = 'toggle-input';
+    if (field.min !== undefined) Object.assign(input, { min: field.min, max: key === 'maxBounces' ? bounceLimit(scene.parameters) : field.max, step: field.step });
   }
   return input;
 }
@@ -368,6 +384,8 @@ function updateExportPreviewStatus(status) {
   document.querySelector('#refresh-preview').disabled = !status.ready || !!status.exporting || previewBusy;
   document.querySelector('#close-export').disabled = !!status.exporting;
   document.querySelector('#export-format').disabled = !!status.exporting;
+  document.querySelector('#export-depth').disabled = !!status.exporting;
+  document.querySelector('#export-terrain-scale').disabled = !!status.exporting;
   document.querySelector('#export-framing').disabled = !!status.exporting || document.querySelector('#export-format').value === 'geotiff';
   document.querySelector('#export-scale').disabled = !!status.exporting || document.querySelector('#export-format').value === 'geotiff';
   const orthographic = document.querySelector('#export-format').value === 'geotiff';
@@ -428,7 +446,7 @@ async function showExportResult() {
   setPreviewZoom(previewZoom);
   document.querySelector('#preview-progress').textContent='已导出';
 }
-function setExportFormat() {
+function setExportFormat(preserveSize = false) {
   const geotiff=document.querySelector('#export-format').value==='geotiff';
   const framing=document.querySelector('#export-framing');
   if(geotiff) framing.value='source';
@@ -439,19 +457,30 @@ function setExportFormat() {
   document.querySelector('#preview-kind').textContent=exportSettings.exportOrthographic?'原图正射':'当前视图';
   document.querySelector('#export-image').hidden=geotiff;
   document.querySelector('#export-geotiff').hidden=!geotiff;
-  setExportScale(1);
+  if (preserveSize !== true) setExportScale(1);
   updateExportDimensions();
   scheduleExportPreview();
   if(typeof syncComboboxes==='function') syncComboboxes();
 }
-document.querySelector('#export-framing').addEventListener('change',setExportFormat);
-document.querySelector('#export-format').addEventListener('change', setExportFormat);
+document.querySelector('#export-framing').addEventListener('change',() => setExportFormat());
+document.querySelector('#export-format').addEventListener('change', () => setExportFormat());
 document.querySelector('#export-extent').addEventListener('change', event => {
   if (renderStatus?.exporting) return;
   exportSettings.exportShadow = event.target.value === 'shadow';
   document.querySelector('#shadow-options').hidden = !exportSettings.exportShadow;
   updateExportDimensions();
   scheduleExportPreview();
+});
+document.querySelector('#export-terrain-scale').addEventListener('change', event => {
+  if (renderStatus?.exporting) return;
+  exportSettings.exportTerrainScale = normalizeParameter('exportTerrainScale', event.target.value);
+  resetExportResult(); scheduleExportPreview();
+});
+
+document.querySelector('#export-depth').addEventListener('change', event => {
+  if (renderStatus?.exporting) return;
+  exportSettings.outputBitDepth = Number(event.target.value);
+  resetExportResult(); scheduleExportPreview();
 });
 document.querySelector('#export-geotiff').hidden = true;
 document.querySelector('#refresh-preview').addEventListener('click', () => void refreshExportPreview());
@@ -560,6 +589,9 @@ function render() {
   const stops = colors.map((color, index) => scene.parameters.rampInterpolation === 'discrete' ? `${color} ${index*20}% ${(index+1)*20}%` : `${color} ${index*25}%`);
   document.querySelector('#ramp-preview').style.background = `linear-gradient(to right,${stops.join(',')})`;
   document.querySelectorAll('[data-key]').forEach(input => {
+    if (fields[input.dataset.key]?.type === 'boolean') { input.checked = scene.parameters[input.dataset.key]; return; }
+    if (input.dataset.key.startsWith('contour')) input.closest('.field').hidden = !scene.parameters.contourEnabled;
+    if (input.dataset.key === 'maxBounces') { input.max = bounceLimit(scene.parameters); input.setCustomValidity(''); }
     input.value = input.dataset.colorIndex !== undefined ? scene.parameters.rampColors[Number(input.dataset.colorIndex)] : (exportKeys.has(input.dataset.key) || input.dataset.scope === 'export' ? exportSettings : scene.parameters)[input.dataset.key];
   });
   document.querySelectorAll('[data-key=stretchDeviations],[data-key=stretchLow],[data-key=stretchHigh]').forEach(input => {
@@ -597,7 +629,7 @@ document.addEventListener('input', event => {
   try {
     const key = input.dataset.key;
     const field = fields[key];
-    let value = field.min !== undefined ? input.valueAsNumber : input.value;
+    let value = field.type === 'boolean' ? input.checked : field.min !== undefined ? input.valueAsNumber : input.value;
     if (exportKeys.has(key) || input.dataset.scope === 'export') {
       const normalized = normalizeParameter(key, value);
       if (key === 'width' || key === 'height') {
@@ -613,6 +645,7 @@ document.addEventListener('input', event => {
         if (peer !== input && (peer.dataset.scope ?? '') === (input.dataset.scope ?? '')) peer.value = exportSettings[key];
       });
       if (key === 'stretchType') { render(); overlaysChanged(); }
+      sourceSettings.request();
       scheduleExportPreview();
       if (typeof updateExportDimensions === 'function') updateExportDimensions();
       return;
@@ -623,12 +656,19 @@ document.addEventListener('input', event => {
       value = [...scene.parameters.rampColors];
       value[index] = input.value;
     }
-    scene.parameters[key] = normalizeParameter(key, value);
+    const normalized = normalizeParameter(key, value);
+    if (key === 'maxBounces' && normalized > bounceLimit(scene.parameters)) throw new Error('数值超出范围');
+    if (key === 'skyModel') {
+      if (switchSkyModel(scene.parameters, normalized)) document.querySelectorAll('[data-key="skyIntensity"]').forEach(peer => { peer.value = scene.parameters.skyIntensity; });
+    } else scene.parameters[key] = normalized;
     if (key === 'rampColors') scene.parameters.colorRamp = 'custom';
     if ((key === 'colorRamp' || key === 'rampInterpolation') && scene.parameters.colorRamp !== 'custom') scene.parameters.rampColors = rampPalette(scene.parameters);
     input.setCustomValidity('');
     document.querySelectorAll(`[data-key="${key}"]`).forEach(peer => {
-      if (peer !== input && peer.dataset.scope !== 'export') peer.value = field.type === 'color5' ? scene.parameters[key][Number(peer.dataset.colorIndex)] : scene.parameters[key];
+      if (peer !== input && peer.dataset.scope !== 'export') {
+        if (field.type === 'boolean') peer.checked = scene.parameters[key];
+        else peer.value = field.type === 'color5' ? scene.parameters[key][Number(peer.dataset.colorIndex)] : scene.parameters[key];
+      }
     });
     if (key === 'colorRamp' || key === 'rampColors' || key === 'rampInterpolation') { render(); overlaysChanged(); }
     if (key === 'stretchType') { render(); overlaysChanged(); }
@@ -638,6 +678,7 @@ document.addEventListener('input', event => {
 
 document.addEventListener('change', event => {
   if (event.target.dataset.key) render();
+  if (event.target.dataset.key || event.target.id?.startsWith('export-')) sourceSettings.request();
 });
 function selectTab(button) {
   if (renderStatus?.exporting || button.disabled) return;
@@ -684,9 +725,26 @@ document.addEventListener('click', event => {
   if (!event.target.closest('#camera,#camera-toggle')) cameraOpen(false);
 });
 document.addEventListener('keydown', event => {
+  if (acceptsExperimentalShortcut(event) && toggleBounceTestMode()) event.preventDefault();
+}, { capture: true });
+
+document.addEventListener('keydown', event => {
   if (event.key === 'Escape') cameraOpen(false);
   if (event.key === 'Tab' && event.target === document.body && !document.querySelector('dialog[open]')) { event.preventDefault(); togglePanels(); }
 });
+
+let bounceNoticeTimer = null;
+function toggleBounceTestMode() {
+  if (nativeDialogOpen || removingTexture || renderStatus?.exporting || document.querySelector('dialog[open]')) return false;
+  const active = toggleExperimentalBounces(scene.parameters);
+  const notice = document.querySelector('#bounce-test-notice');
+  clearTimeout(bounceNoticeTimer);
+  notice.textContent = active ? '反弹测试模式 · 上限 100' : '反弹测试模式已关闭 · 上限 15';
+  notice.hidden = false;
+  if (!active) bounceNoticeTimer = setTimeout(() => { notice.hidden = true; overlaysChanged(); }, 4000);
+  render(); queueParameterUpdate(); overlaysChanged();
+  return true;
+}
 document.querySelector('#show-output').addEventListener('click', () => {
   const dialog = document.querySelector('#export-dialog');
   if (!dialog.open) {
@@ -694,14 +752,18 @@ document.querySelector('#show-output').addEventListener('click', () => {
     exportViewport={width:rect.width,height:rect.height};
     exportSceneSnapshot=freezeCurrentView(rendererParams(),exportViewport);
     exportSourceStatus=cloneScene(renderStatus ?? {});
-    for (const key of stretchKeys) exportSettings[key] = scene.parameters[key];
-    resetExportResult(); setExportFormat();
+    if (!presetStretchScene || stretchKeys.some(key => scene.parameters[key] !== presetStretchScene[key])) {
+      for (const key of stretchKeys) exportSettings[key] = scene.parameters[key];
+      presetStretchScene = null;
+    }
+    resetExportResult(); setExportFormat(true);
     render(); dialog.showModal(); overlaysChanged();
   }
   void refreshExportPreview();
 });
 if (matchMedia('(max-width:800px)').matches) panelVisible('map-panel', false);
 const appWindow = window.__TAURI__?.window?.getCurrentWindow();
+if (appWindow) void flushSettingsOnClose(appWindow,()=>sourceSettings.flush(),error=>console.warn('设置快照',error)).catch(error=>console.warn('设置快照',error));
 for (const [id, action] of [['window-minimize', 'minimize'], ['window-maximize', 'toggleMaximize'], ['window-close', 'close']]) {
   document.querySelector(`#${id}`).addEventListener('click', () => {
     if (appWindow) void appWindow[action]().catch(showError);
@@ -729,6 +791,58 @@ document.querySelector('#reset-camera').addEventListener('click', () => {
   render();
   queueParameterUpdate();
 });
+// Presets contain validated render settings only; assets remain owned by the renderer.
+const presetStore = createPresetStore({getItem:key=>window.localStorage.getItem(key),setItem:(key,value)=>window.localStorage.setItem(key,value)});
+function refreshRenderPresets(selected) {
+  const select=document.querySelector('#render-preset');
+  const items=presetStore.list();
+  select.replaceChildren();
+  const empty=document.createElement('option'); empty.value=''; empty.textContent='最近使用'; select.append(empty);
+  for(const entry of items) {const option=document.createElement('option');option.value=entry.name;option.textContent=entry.name;select.append(option);}
+  select.value=selected ?? items[0]?.name ?? '';
+  syncComboboxes(); overlaysChanged();
+}
+function currentPresetSettings() {
+  return {parameters:scene.parameters,output:exportSettings,format:document.querySelector('#export-format').value,
+    framing:document.querySelector('#export-framing').value,scale:document.querySelector('#export-scale').value};
+}
+function installRenderPreset(settings) {
+  const applied=applyPresetSettings(scene.parameters,exportSettings,settings,!!renderStatus?.textureName);
+  presetStretchScene = Object.fromEntries(stretchKeys.map(key => [key, scene.parameters[key]]));
+  document.querySelector('#export-format').value=applied.format;
+  document.querySelector('#export-framing').value=applied.framing;
+  document.querySelector('#export-scale').value=applied.scale;
+  document.querySelector('#export-depth').value=String(exportSettings.outputBitDepth);
+  document.querySelector('#export-terrain-scale').value=exportSettings.exportTerrainScale;
+  document.querySelector('#export-extent').value=exportSettings.exportShadow?'shadow':'source';
+  document.querySelector('#shadow-options').hidden=!exportSettings.exportShadow;
+  exportSceneSnapshot=null; exportViewport=null; exportSourceStatus=null;
+  render(); resetExportResult(); setExportFormat(true); queueParameterUpdate(); overlaysChanged();
+}
+document.querySelector('#save-preset').addEventListener('click',()=>{
+  if(renderStatus?.exporting || removingTexture) return;
+  const input=document.querySelector('#preset-name');
+  try {const entry=presetStore.save(input.value,currentPresetSettings());input.setCustomValidity('');refreshRenderPresets(entry.name);}
+  catch(error) {input.setCustomValidity(String(error.message));input.reportValidity();}
+});
+document.querySelector('#preset-name').addEventListener('input',event=>event.target.setCustomValidity(''));
+document.querySelector('#render-preset').addEventListener('change',event=>{document.querySelector('#preset-name').value=event.target.value;});
+document.querySelector('#apply-preset').addEventListener('click',()=>{
+  if(renderStatus?.exporting || removingTexture) return;
+  try {const name=document.querySelector('#render-preset').value;const settings=presetStore.use(name);if(settings){installRenderPreset(settings);refreshRenderPresets(name);}}
+  catch(error) {void showError(error);}
+});
+document.querySelector('#remove-preset').addEventListener('click',()=>{
+  if(renderStatus?.exporting || removingTexture) return;
+  try {presetStore.remove(document.querySelector('#render-preset').value);refreshRenderPresets();}
+  catch(error) {void showError(error);}
+});
+document.querySelector('#reset-render').addEventListener('click',()=>{
+  if(renderStatus?.exporting || removingTexture) return;
+  installRenderPreset(defaultPresetSettings());
+});
+refreshRenderPresets();
+
 document.querySelector('#close-error').addEventListener('click', () => document.querySelector('#error-dialog').close());
 document.querySelector('#error-dialog').addEventListener('close', () => {
   lastError = '';
@@ -805,6 +919,7 @@ if (invoke) {
     window.addEventListener('resize', () => void resizeViewport().catch(showError));
     document.addEventListener('visibilitychange', () => void resizeViewport().catch(showError));
     const listen = window.__TAURI__.event.listen;
+    await listen('viewport-test-bounces', () => toggleBounceTestMode());
     await listen('viewport-orbit', event => { if (!document.querySelector('#export-dialog').open) orbitCamera(event.payload.dx, event.payload.dy); });
     await listen('viewport-pan', event => { if (!document.querySelector('#export-dialog').open) panCamera(...nativePanPixels(event.payload, window.devicePixelRatio)); });
     await listen('viewport-zoom', event => { if (!document.querySelector('#export-dialog').open) zoomCamera(event.payload.delta); });

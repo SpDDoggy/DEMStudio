@@ -1,6 +1,6 @@
 //! Windows child viewport. All GL state stays on one dedicated render thread.
 use super::{
-    appearance::ColorTexture, gl_renderer::GlRenderer, HeightMap, OverlayRect, RenderParams,
+    appearance::ColorTexture, gl_renderer::{GlRenderer, PagedExport}, HeightMap, OverlayRect, RenderParams,
     RenderStatus, ViewportRect,
     thumbnail::{ExportFrame, Thumbnail},
 };
@@ -22,7 +22,7 @@ use windows::{
         Graphics::{Gdi::*, OpenGL::*},
         System::LibraryLoader::*,
         UI::{
-            Input::KeyboardAndMouse::{ReleaseCapture, SetCapture},
+            Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, GetKeyState},
             Shell::{
                 DefSubclassProc, GetWindowSubclass, RemoveWindowSubclass, SHAppBarMessage,
                 SetWindowSubclass, ABE_BOTTOM, ABE_LEFT, ABE_RIGHT, ABE_TOP, ABM_GETAUTOHIDEBAREX,
@@ -89,24 +89,114 @@ fn export_preview_params(
     params
 }
 
-/// Bound the dense terrain texture independently of the export's pixel grid.
-/// The source grid still determines exact output pixel centres and georeference.
-fn export_geometry_edge(width: u32, height: u32, gpu_limit: u32) -> u32 {
-    // Preserve the existing full-resolution path for original supported sources.
-    // The bounded large-source path must not silently reduce their terrain detail.
-    if width.max(height) <= super::raster::MAX_DECODE_EDGE
-        && width.max(height).next_power_of_two() <= gpu_limit
-    {
-        return width.max(height).max(2);
+/// Geometry resolution is independent of output pixels and georeferencing.
+#[derive(Debug, PartialEq)]
+enum ExportTerrainPlan { Preview, Dense(u32), Paged(u32) }
+
+fn export_terrain_plan(
+    width: u32, height: u32, gpu_limit: u32, _tiff: bool, mode: &str,
+) -> Result<ExportTerrainPlan,String> {
+    let factor=match mode {
+        "preview"=>return Ok(ExportTerrainPlan::Preview),
+        "source"=>1,"half"=>2,"quarter"=>4,
+        _=>return Err("无效的导出地形精度".into()),
+    };
+    let edge=width.max(height).div_ceil(factor).max(2);
+    let dense_limit=gpu_limit.min(super::raster::MAX_DECODE_EDGE);
+    if edge.checked_next_power_of_two().is_some_and(|padded|padded<=dense_limit) {
+        Ok(ExportTerrainPlan::Dense(edge))
+    } else {
+        Ok(ExportTerrainPlan::Paged(factor))
     }
-    let mut edge = width.max(height).min(8192).min(gpu_limit).max(2);
-    let ratio = (edge as f64 / width.max(height).max(1) as f64).min(1.);
-    let w = (width as f64 * ratio).round().max(2.) as u64;
-    let h = (height as f64 * ratio).round().max(2.) as u64;
-    if w * h * 4 > 128 * 1024 * 1024 {
-        edge = edge.min(4096);
+}
+
+unsafe fn prepare_export_terrain(
+    renderer:&mut GlRenderer, preview:&HeightMap, desired:&RenderParams,
+    geo:bool, cancel:&AtomicBool,status:&Arc<Mutex<RenderStatus>>,
+) -> Result<Option<PagedExport>,String> {
+    if cancel.load(Ordering::Acquire){return Err("已取消导出".into());}
+    let Some(source)=&preview.source else {return Ok(None);};
+    let tiff=source.path.extension().and_then(|ext|ext.to_str())
+        .is_some_and(|ext|ext.eq_ignore_ascii_case("tif")||ext.eq_ignore_ascii_case("tiff"));
+    match export_terrain_plan(source.width,source.height,renderer.heightmap_edge_limit(),tiff,&desired.export_terrain_scale)? {
+        ExportTerrainPlan::Preview=>Ok(None),
+        ExportTerrainPlan::Paged(factor)=>{
+            let mut last=0;
+            renderer.begin_source_export(preview,desired,factor,geo,cancel,|scanned,total|{
+                let percent=(scanned.saturating_mul(5)/total.max(1)).min(5) as u32;
+                if percent!=last {status.lock().unwrap_or_else(|e|e.into_inner()).export_progress=percent;last=percent;}
+            }).map(Some)
+        },
+        ExportTerrainPlan::Dense(edge)=>{
+            let full=super::raster::load(&source.path,edge)?;
+            if cancel.load(Ordering::Acquire){return Err("已取消导出".into());}
+            let loaded=full.source.as_ref().ok_or("重新读取的源图像无效")?;
+            let same_geo=serde_json::to_value(&source.geo).map_err(|e|e.to_string())?
+                ==serde_json::to_value(&loaded.geo).map_err(|e|e.to_string())?;
+            if loaded.width!=source.width || loaded.height!=source.height || !same_geo {
+                return Err("源图像尺寸或地理参考已改变，请重新导入后导出".into());
+            }
+            renderer.upload_map(&full)?;
+            Ok(None)
+        }
     }
-    edge
+}
+
+fn export_microtiles(width:u32,height:u32,paged:bool,bounces:u32)->impl Iterator<Item=[u32;4]> {
+    let (step_x,step_y)=if paged {if bounces<=15 {(512,128)}else{(256,64)}}else{(width.max(1),height.max(1))};
+    (0..height).step_by(step_y as usize).flat_map(move |y|
+        (0..width).step_by(step_x as usize).map(move |x|[x,y,step_x.min(width-x),step_y.min(height-y)]))
+}
+
+/// Encoders keep their bounded strips; paged rendering uses smaller GPU windows.
+unsafe fn render_export_tile(
+    renderer:&mut GlRenderer, paged:&mut Option<PagedExport>, desired:&RenderParams,
+    full_size:[u32;2], tile:[u32;4], geo:bool,
+    completed:&mut u64,total:u64,status:&Arc<Mutex<RenderStatus>>,cancel:&AtomicBool,
+) -> Result<Vec<u8>,String> {
+    let [x,y,width,height]=tile;
+    if *completed == 0 {
+        status.lock().unwrap_or_else(|e|e.into_inner()).export_work_progress=Some(0.);
+    }
+    let pixel_bytes=if desired.output_bit_depth==16 {8usize}else{4};
+    let row_bytes=(width as usize).checked_mul(pixel_bytes).ok_or("导出分块尺寸溢出")?;
+    let mut result=vec![0;row_bytes.checked_mul(height as usize).ok_or("导出分块尺寸溢出")?];
+    for [dx,dy,w,h] in export_microtiles(width,height,paged.is_some(),desired.max_bounces) {
+        if cancel.load(Ordering::Acquire){return Err("已取消导出".into());}
+        let mut params=desired.clone();params.width=w;params.height=h;params.grid=false;
+        if params.export_terrain_scale!="preview" {params.lod=0;}
+        renderer.set_params(&params)?;
+        if geo {
+            renderer.set_geo_tile(Some([x+dx,y+dy,w,h]))?;
+            renderer.reset_accumulation();renderer.restart_sampling_sequence();
+        } else {
+            renderer.set_output_tile(Some((full_size,[x+dx,y+dy,w,h])))?;
+        }
+        while renderer.samples()<desired.samples.max(1) {
+            if cancel.load(Ordering::Acquire){return Err("已取消导出".into());}
+            let finished=match paged.as_mut() {
+                Some(source)=>renderer.render_source_sample(source,cancel)?,
+                None=>renderer.render_export_sample_step()?,
+            };
+            if finished {
+                *completed+=u64::from(w)*u64::from(h);
+                let mut state=status.lock().unwrap_or_else(|e|e.into_inner());
+                state.export_work_progress=Some((*completed as f64 * 100. / total.max(1) as f64).min(100.));
+                state.export_progress=
+                    (if paged.is_some() {5+completed.saturating_mul(95)/total.max(1)}
+                    else {completed.saturating_mul(100)/total.max(1)}).min(99) as u32;
+            }
+        }
+        if let Some(source)=paged.as_mut(){renderer.finish_source_surface(source,cancel)?;}
+        let pixels=renderer.export_pixels_for_output()?;
+        let part_row=w as usize*pixel_bytes;
+        if pixels.len()!=part_row*h as usize{return Err("导出分块像素数量无效".into());}
+        for row in 0..h as usize {
+            let dst=(dy as usize+row)*row_bytes+dx as usize*pixel_bytes;
+            result[dst..dst+part_row].copy_from_slice(&pixels[row*part_row..(row+1)*part_row]);
+        }
+    }
+    Ok(result)
 }
 
 fn latest_interactive_params(
@@ -868,6 +958,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
     match msg {
+        WM_KEYDOWN if !input.is_null() && wp.0 == 0xc0 && lp.0 & (1 << 30) == 0 => {
+            if GetKeyState(0x11) < 0 && GetKeyState(0x10) < 0
+                && [0x12,0x5b,0x5c].into_iter().all(|key| GetKeyState(key) >= 0) {
+                let _=(*input).app.emit("viewport-test-bounces", ());
+                return LRESULT(0);
+            }
+        }
         WM_PAINT => {
             if !input.is_null() {
                 request_repaint(hwnd);
@@ -1078,6 +1175,13 @@ impl WglContext {
     }
 }
 
+// The stored result preview remains bounded RGBA8, independently of file depth.
+fn output_thumbnail_bytes(pixels: &[u8], depth: u8) -> std::borrow::Cow<'_, [u8]> {
+    if depth==16 {
+        std::borrow::Cow::Owned(pixels.chunks_exact(2).map(|p|((u32::from(u16::from_ne_bytes([p[0],p[1]]))+128)/257) as u8).collect())
+    } else {std::borrow::Cow::Borrowed(pixels)}
+}
+
 unsafe fn export_source_grid(
     renderer: &mut GlRenderer,
     preview: &HeightMap,
@@ -1098,22 +1202,8 @@ unsafe fn export_source_grid(
     if source.geo.is_none() {
         return Err("源图像没有地理坐标，无法导出带坐标系的 TIFF".into());
     }
-    // Export pixels retain the source grid, while geometry stays within a bounded
-    // GPU texture. Very large sources use area-reduced heights, never a dense
-    // 81200² heightmap or full-resolution RGBA frame.
-    let geometry_edge =
-        export_geometry_edge(source.width, source.height, renderer.heightmap_edge_limit());
-    let full = super::raster::load(&source.path, geometry_edge)?;
-    check_cancel()?;
-    let loaded = full.source.as_ref().ok_or("重新读取的源图像没有地理参考")?;
-    let same_geo = serde_json::to_value(&source.geo).map_err(|e| e.to_string())?
-        == serde_json::to_value(&loaded.geo).map_err(|e| e.to_string())?;
-    if loaded.width != source.width || loaded.height != source.height || !same_geo {
-        return Err("源图像尺寸或地理参考已改变，请重新导入后导出".into());
-    }
-    renderer.upload_map(&full)?;
-    drop(full);
-    check_cancel()?;
+    let mut paged=prepare_export_terrain(renderer,preview,desired,true,cancel,status)?;
+    let result=(||->Result<ExportFrame,String>{
     let extent =
         super::export_extent::ExportExtent::for_source(source.width, source.height, desired)?;
     renderer.set_geo_grid(Some([source.width, source.height, extent.left, extent.top]))?;
@@ -1121,41 +1211,29 @@ unsafe fn export_source_grid(
     let total = u64::from(extent.width) * u64::from(extent.height) * u64::from(samples);
     let mut completed = 0u64;
     let mut thumbnail = Thumbnail::new(extent.width, extent.height)?;
-    freeze_export_stretch(renderer, desired, [extent.width,extent.height], true, cancel)?;
-    super::geotiff::write_orthographic_extent(
+    freeze_export_stretch_with_source(renderer, desired, [extent.width,extent.height], true, cancel, &mut paged)?;
+    super::geotiff::write_orthographic_extent_depth(
         path,
         source,
         extent.width,
         extent.height,
         extent.left,
         extent.top,
+        desired.output_bit_depth,
         |x, y, width, height| {
             check_cancel()?;
-            let mut params = desired.clone();
-            params.width = width;
-            params.height = height;
-            params.projection = "orthographic".into();
-            params.grid = false;
-            renderer.set_params(&params)?;
-            renderer.set_geo_tile(Some([x, y, width, height]))?;
-            renderer.reset_accumulation();
-            let tile_pixels = u64::from(width) * u64::from(height);
-            while renderer.samples() < samples {
-                check_cancel()?;
-                if renderer.render_export_sample_step()? {
-                    completed += tile_pixels;
-                    let mut state = status.lock().unwrap_or_else(|e| e.into_inner());
-                    state.export_progress =
-                        (completed.saturating_mul(100) / total.max(1)).min(99) as u32;
-                }
-            }
-            check_cancel()?;
-            let pixels = renderer.export_pixels()?;
-            thumbnail.add_tile(x, y, width, height, &pixels)?;
+            let mut params=desired.clone();params.projection="orthographic".into();
+            let pixels=render_export_tile(renderer,&mut paged,&params,[extent.width,extent.height],
+                [x,y,width,height],true,&mut completed,total,status,cancel)?;
+            let preview = output_thumbnail_bytes(&pixels, desired.output_bit_depth);
+            thumbnail.add_tile(x, y, width, height, &preview)?;
             Ok(pixels)
         },
     )?;
     thumbnail.finish()
+    })();
+    if let Some(source)=paged.take(){renderer.end_source_export(source);}
+    result
 }
 
 // One bounded, whole-frame statistics pass is frozen for all output tiles.
@@ -1163,6 +1241,13 @@ unsafe fn export_source_grid(
 unsafe fn freeze_export_stretch(
     renderer: &mut GlRenderer, desired: &RenderParams, size: [u32;2], geo: bool, cancel: &AtomicBool,
 ) -> Result<(),String> {
+    freeze_export_stretch_with_source(renderer,desired,size,geo,cancel,&mut None)
+}
+
+unsafe fn freeze_export_stretch_with_source(
+    renderer:&mut GlRenderer,desired:&RenderParams,size:[u32;2],geo:bool,cancel:&AtomicBool,
+    paged:&mut Option<PagedExport>,
+)->Result<(),String>{
     renderer.clear_frozen_stretch();
     if desired.stretch_type == "none" { return Ok(()); }
     let scale=256. / size[0].max(size[1]).max(1) as f64;
@@ -1170,6 +1255,7 @@ unsafe fn freeze_export_stretch(
     pilot.width=(size[0] as f64*scale).round().max(2.) as u32;
     pilot.height=(size[1] as f64*scale).round().max(2.) as u32;
     pilot.samples=4;pilot.grid=false;
+    if pilot.export_terrain_scale!="preview" {pilot.lod=0;}
     renderer.set_params(&pilot)?;
     if geo { renderer.set_geo_tile(Some([0,0,size[0],size[1]]))?; }
     else { renderer.set_output_tile(None)?; }
@@ -1177,8 +1263,12 @@ unsafe fn freeze_export_stretch(
     renderer.restart_sampling_sequence();
     while renderer.samples() < 4 {
         if cancel.load(Ordering::Acquire){return Err(if geo {"已取消 TIFF 导出"} else {"已取消 PNG 导出"}.into());}
-        renderer.render_export_sample_step()?;
+        match paged.as_mut() {
+            Some(source)=>{renderer.render_source_sample(source,cancel)?;},
+            None=>{renderer.render_export_sample_step()?;},
+        }
     }
+    if let Some(source)=paged.as_mut(){renderer.finish_source_surface(source,cancel)?;}
     renderer.freeze_stretch_from_current();
     Ok(())
 }
@@ -1213,20 +1303,17 @@ unsafe fn export_camera_png(
     let mut params = desired.clone();
     params.grid = false;
     if params.export_orthographic {
+        params.export_shadow = false;
+        params.projection = "orthographic".into();
+    }
+    if params.export_orthographic {validate_orthographic_png_size(preview,&params)?;}
+    let mut paged=prepare_export_terrain(renderer,preview,&params,params.export_orthographic,cancel,status)?;
+    let result=(||->Result<ExportFrame,String>{
+    if params.export_orthographic {
         validate_orthographic_png_size(preview, &params)?;
         // Original footprint only; GeoTIFF shadow expansion stays separate.
         params.export_shadow = false;
         params.projection = "orthographic".into();
-        if let Some(source) = &preview.source {
-            let edge = export_geometry_edge(source.width, source.height, renderer.heightmap_edge_limit());
-            let full = super::raster::load(&source.path, edge)?;
-            let loaded = full.source.as_ref().ok_or("重新读取的源图像无效")?;
-            if loaded.width != source.width || loaded.height != source.height {
-                return Err("源图像尺寸已改变，请重新导入后导出".into());
-            }
-            if cancel.load(Ordering::Acquire) { return Err("已取消 PNG 导出".into()); }
-            renderer.upload_map(&full)?;
-        }
         renderer.set_output_tile(None)?;
         renderer.set_geo_grid(Some([params.width, params.height, 0, 0]))?;
     } else {
@@ -1236,38 +1323,25 @@ unsafe fn export_camera_png(
     let total = u64::from(params.width) * u64::from(params.height) * u64::from(samples);
     let mut completed = 0u64;
     let mut thumbnail = Thumbnail::new(params.width, params.height)?;
-    freeze_export_stretch(renderer, &params, [params.width,params.height], params.export_orthographic, cancel)?;
-    super::png_output::write(
+    freeze_export_stretch_with_source(renderer, &params, [params.width,params.height], params.export_orthographic, cancel, &mut paged)?;
+    super::png_output::write_depth(
         path,
         params.width,
         params.height,
+        params.output_bit_depth,
         |x, y, width, height| {
             if cancel.load(Ordering::Acquire) { return Err("已取消 PNG 导出".into()); }
-            let mut tile = params.clone();
-            tile.width = width;
-            tile.height = height;
-            renderer.set_params(&tile)?;
-            if params.export_orthographic {
-                renderer.set_geo_tile(Some([x, y, width, height]))?;
-                renderer.reset_accumulation();
-                renderer.restart_sampling_sequence();
-            } else {
-                renderer.set_output_tile(Some(([params.width, params.height], [x, y, width, height])))?;
-            }
-            while renderer.samples() < samples {
-                if cancel.load(Ordering::Acquire) { return Err("已取消 PNG 导出".into()); }
-                if renderer.render_export_sample_step()? {
-                    completed += u64::from(width) * u64::from(height);
-                    status.lock().unwrap_or_else(|e| e.into_inner()).export_progress =
-                        (completed.saturating_mul(100) / total.max(1)).min(99) as u32;
-                }
-            }
-            let pixels = renderer.export_pixels()?;
-            thumbnail.add_tile(x, y, width, height, &pixels)?;
+            let pixels=render_export_tile(renderer,&mut paged,&params,[params.width,params.height],
+                [x,y,width,height],params.export_orthographic,&mut completed,total,status,cancel)?;
+            let preview = output_thumbnail_bytes(&pixels, params.output_bit_depth);
+            thumbnail.add_tile(x, y, width, height, &preview)?;
             Ok(pixels)
         },
     )?;
     thumbnail.finish()
+    })();
+    if let Some(source)=paged.take(){renderer.end_source_export(source);}
+    result
 }
 
 unsafe fn render_thread(
@@ -1467,6 +1541,12 @@ unsafe fn render_thread(
                     }
                     let (name, width, height) = (map.name.clone(), map.width, map.height);
                     renderer.upload_map(&map)?;
+                    if let Some(scale)=super::initial_height_scale(&map) {
+                        desired.height_scale=scale;
+                        desired.height_scale_mode="linear".into();
+                        desired.height_curve=1.;
+                        renderer.set_params(&if preview {preview_params(&desired)} else {desired.clone()})?;
+                    }
                     has_map = true;
                     dirty = true;
                     let mut s = status.lock().unwrap_or_else(|e| e.into_inner());
@@ -1496,12 +1576,14 @@ unsafe fn render_thread(
                         let mut state = status.lock().unwrap_or_else(|e| e.into_inner());
                         state.exporting = true;
                         state.export_progress = 0;
+                        state.export_work_progress = None;
                     }
                     let result = (|| -> Result<_, String> {
                         if !has_map {
                             return Err("尚无高度图".into());
                         }
                         let mut params = export_params(&desired, params);
+                        params.output_bit_depth = 8;
                         params.grid = false;
                         renderer.set_params(&params)?;
                         // Editing aids never enter the output. Finish every requested sample.
@@ -1511,6 +1593,7 @@ unsafe fn render_thread(
                             }
                             renderer.render_export_sample_step()?;
                             let mut state = status.lock().unwrap_or_else(|e| e.into_inner());
+                            state.export_work_progress=Some(f64::from(renderer.samples()) * 100. / f64::from(params.samples.max(1)));
                             state.export_progress =
                                 (renderer.samples() * 100 / params.samples.max(1)).min(99);
                         }
@@ -1540,6 +1623,7 @@ unsafe fn render_thread(
                     {
                         let mut state = status.lock().unwrap_or_else(|e| e.into_inner());
                         state.exporting = false;
+                        state.export_work_progress = None;
                         if result.is_ok() {
                             state.export_progress = 100;
                         }
@@ -1552,6 +1636,7 @@ unsafe fn render_thread(
                         let mut state = status.lock().unwrap_or_else(|e| e.into_inner());
                         state.exporting = true;
                         state.export_progress = 0;
+                        state.export_work_progress = None;
                     }
                     let params = export_params(&desired, params);
                     let result = match current_preview.as_ref() {
@@ -1562,9 +1647,7 @@ unsafe fn render_thread(
                         renderer.clear_frozen_stretch();
                         renderer.set_output_tile(None)?;
                         renderer.set_geo_tile(None)?;
-                        if params.export_orthographic {
-                            if let Some(map) = current_preview.as_ref() { renderer.upload_map(map)?; }
-                        }
+                        if let Some(map) = current_preview.as_ref() { renderer.upload_map(map)?; }
                         renderer.set_params(&desired)?;
                         renderer.reset_accumulation();
                         renderer.render_sample()?;
@@ -1585,6 +1668,7 @@ unsafe fn render_thread(
                     {
                         let mut state = status.lock().unwrap_or_else(|e| e.into_inner());
                         state.exporting = false;
+                        state.export_work_progress = None;
                         if result.is_ok() {
                             state.export_progress = 100;
                         }
@@ -1667,6 +1751,7 @@ unsafe fn render_thread(
                         let mut state = status.lock().unwrap_or_else(|e| e.into_inner());
                         state.exporting = true;
                         state.export_progress = 0;
+                        state.export_work_progress = None;
                     }
                     let export = export_params(&desired, params);
                     let result = match current_preview.as_ref() {
@@ -1715,6 +1800,7 @@ unsafe fn render_thread(
                     {
                         let mut state = status.lock().unwrap_or_else(|e| e.into_inner());
                         state.exporting = false;
+                        state.export_work_progress = None;
                         if result.is_ok() {
                             state.export_progress = 100;
                         }
@@ -1792,5 +1878,3 @@ unsafe fn render_thread(
     drop(renderer);
     Ok(())
 }
-
-

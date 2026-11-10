@@ -8,6 +8,9 @@ mod stretch;
 #[path = "sample_job.rs"]
 mod sample_job;
 use sample_job::SampleJob;
+#[path = "paged_gpu.rs"]
+mod paged_gpu;
+pub use paged_gpu::PagedExport;
 
 
 
@@ -87,6 +90,8 @@ struct MapGeometry {
     width: u32,
     height: u32,
     span: f32,
+    source_elevation: [f64; 2],
+    source_size: [u32; 2],
 }
 
 pub struct GlRenderer {
@@ -114,8 +119,18 @@ pub struct GlRenderer {
     stretch_frozen: Cell<bool>,
     vao: glow::VertexArray,
     height_tex: glow::Texture,
+    contour_tex: glow::Texture,
+    contour_ready: Cell<bool>,
+    // Unwarped, display-normalized texels. Curves are always rebuilt from this
+    // base so toggling modes never modifies the source or compounds rounding.
+    height_base: Vec<f32>,
+    paged_geometry: bool,
+    paged_coarse_cache: Option<paged_gpu::CoarseCache>,
     rand_tex: glow::Texture,
     color_tex: glow::Texture,
+    sky_tex: glow::Texture,
+    sky_altitude: Option<f32>,
+    sky_mean: [f32; 3],
     color_size: [u32; 2],
     accum: glow::Texture,
     output: glow::Texture,
@@ -163,8 +178,10 @@ impl GlRenderer {
         let lut_tex = gl.create_texture()?;
         let vao = gl.create_vertex_array()?;
         let height_tex = gl.create_texture()?;
+        let contour_tex = gl.create_texture()?;
         let rand_tex = gl.create_texture()?;
         let color_tex = gl.create_texture()?;
+        let sky_tex = gl.create_texture()?;
         let accum = gl.create_texture()?;
         let output = gl.create_texture()?;
         let accum_fbo = gl.create_framebuffer()?;
@@ -181,8 +198,16 @@ impl GlRenderer {
             stretch_export: Cell::new(false), stretch_frozen: Cell::new(false),
             vao,
             height_tex,
+            contour_tex,
+            contour_ready: Cell::new(false),
+            height_base: Vec::new(),
+            paged_geometry: false,
+            paged_coarse_cache: None,
             rand_tex,
             color_tex,
+            sky_tex,
+            sky_altitude: None,
+            sky_mean: [1.; 3],
             color_size: [1, 1],
             accum,
             output,
@@ -217,6 +242,10 @@ impl GlRenderer {
             glow::PixelUnpackData::Slice(Some(bytes(&noise))),
         );
         s.texture_filter(glow::NEAREST, glow::REPEAT);
+        s.gl.bind_texture(glow::TEXTURE_2D,Some(contour_tex));
+        s.texture_filter(glow::LINEAR,glow::CLAMP_TO_EDGE);
+        s.gl.tex_image_2d(glow::TEXTURE_2D,0,glow::RG32F as i32,1,1,0,glow::RG,glow::FLOAT,
+            glow::PixelUnpackData::Slice(Some(bytes(&[0.,0.]))));
         s.gl.bind_texture(glow::TEXTURE_2D, Some(color_tex));
         s.gl.tex_image_2d(
             glow::TEXTURE_2D,
@@ -230,6 +259,10 @@ impl GlRenderer {
             glow::PixelUnpackData::Slice(Some(&[0, 0, 0, 0])),
         );
         s.texture_filter(glow::NEAREST, glow::CLAMP_TO_EDGE);
+        s.gl.bind_texture(glow::TEXTURE_2D, Some(sky_tex));
+        s.gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGB32F as i32, 1, 1, 0,
+            glow::RGB, glow::FLOAT, glow::PixelUnpackData::Slice(Some(bytes(&[1_f32; 3]))));
+        s.texture_filter(glow::LINEAR, glow::CLAMP_TO_EDGE);
         s.allocate()?;
         Ok(s)
     }
@@ -315,11 +348,28 @@ impl GlRenderer {
             return Err("高度图超过 GPU 纹理尺寸上限".into());
         }
         self.padded = size;
+        self.paged_geometry = false;
         self.levels = size.ilog2();
         let mut data = padded_height_texture(map, size);
         for value in &mut data {
             *value = display_sample(*value, map.display_range);
         }
+        self.contour_ready.set(false);
+        self.height_base = data;
+        self.upload_height_levels(effective_height_curve(&self.params));
+        self.map = Some(MapGeometry {
+            width: map.width,
+            height: map.height,
+            span: map.width.max(map.height) as f32 * 0.2,
+            source_elevation: source_elevation_range(map),
+            source_size:map.source.as_ref().map(|v|[v.width,v.height]).unwrap_or([map.width,map.height]),
+        });
+        self.reset();
+        self.check("上传高度图")
+    }
+
+    unsafe fn upload_height_levels(&self, curve: f32) {
+        let mut data = curved_height_texture(&self.height_base, curve);
         self.gl
             .bind_texture(glow::TEXTURE_2D, Some(self.height_tex));
         self.texture_filter(glow::NEAREST_MIPMAP_NEAREST, glow::CLAMP_TO_EDGE);
@@ -333,7 +383,7 @@ impl GlRenderer {
             glow::TEXTURE_MAX_LEVEL,
             self.levels as i32,
         );
-        let mut n = size;
+        let mut n = self.padded;
         for level in 0..=self.levels {
             self.gl.tex_image_2d(
                 glow::TEXTURE_2D,
@@ -354,13 +404,6 @@ impl GlRenderer {
             data = reduced;
             n = next;
         }
-        self.map = Some(MapGeometry {
-            width: map.width,
-            height: map.height,
-            span: map.width.max(map.height) as f32 * 0.2,
-        });
-        self.reset();
-        self.check("上传高度图")
     }
 
     pub unsafe fn heightmap_edge_limit(&self) -> u32 {
@@ -399,6 +442,7 @@ impl GlRenderer {
             p.exposure,
             p.gamma,
             p.height_scale,
+            p.height_curve,
             p.height_offset,
             p.height_step,
         ];
@@ -406,10 +450,14 @@ impl GlRenderer {
             .iter()
             .chain(p.camera_pan.iter())
             .any(|v| !v.is_finite())
+            || !matches!(p.output_bit_depth, 8 | 16)
             || p.width == 0
             || p.height == 0
             || p.gamma <= 0.
             || p.height_scale <= 0.
+            || !["linear", "accelerated", "nonlinear"].contains(&p.height_scale_mode.as_str())
+            || !(0.01..=1000.).contains(&p.height_curve)
+            || (p.height_scale_mode != "nonlinear" && p.height_curve != 1.)
             || !(0. ..=100.).contains(&p.height_offset)
             || p.camera_distance <= 0.
             || p.field_of_view <= 0.
@@ -420,6 +468,8 @@ impl GlRenderer {
             || p.exposure < 0.
             || p.sun_intensity < 0.
             || p.sky_intensity < 0.
+            || !["constant", "atmosphere"].contains(&p.sky_model.as_str())
+            || !(1..=if p.experimental_bounces {100} else {15}).contains(&p.max_bounces)
             || !p.shadow_padding.is_finite()
             || !(1. ..=200.).contains(&p.shadow_padding)
         {
@@ -435,6 +485,7 @@ impl GlRenderer {
             return Err("导出后处理参数超出范围".into());
         }
         validate_display_parameters(p)?;
+        validate_contour_parameters(p)?;
         let max = self.gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) as u32;
         if p.width > max || p.height > max {
             return Err("输出尺寸超过 GPU 限制".into());
@@ -448,11 +499,12 @@ impl GlRenderer {
             // Before the first integrated sample, a metadata pass would alter
             // path jitter while a bicubic strip is still in flight. The normal
             // sample completion applies these display parameters once safely.
-            if self.count > 0 { self.postprocess(); }
+            if self.count > 0 && !self.paged_geometry { self.postprocess(); }
             return Ok(());
         }
         let old = &self.params;
         if old.surface != p.surface
+            || old.experimental_bounces != p.experimental_bounces
             || old.projection != p.projection
             || old.grid != p.grid
             || old.export_shadow != p.export_shadow
@@ -463,8 +515,14 @@ impl GlRenderer {
             self.path = new;
         }
         let resize = old.width != p.width || old.height != p.height
+            || old.output_bit_depth != p.output_bit_depth
             || (old.stretch_type != "none") != (p.stretch_type != "none")
             || needs_surface(old) != needs_surface(p);
+        let curve_changed = effective_height_curve(old) != effective_height_curve(p);
+        if curve_changed && !self.height_base.is_empty() && !self.paged_geometry {
+            self.upload_height_levels(effective_height_curve(p));
+            self.check("更新高度曲线")?;
+        }
         self.params = p.clone();
         if resize {
             self.allocate()?;
@@ -629,6 +687,7 @@ impl GlRenderer {
         self.bind_tex(self.path, "mipmap", 0, self.height_tex);
         self.bind_tex(self.path, "tex_rand", 1, self.rand_tex);
         self.bind_tex(self.path, "tex_color", 2, self.color_tex);
+        self.bind_tex(self.path, "tex_sky_model", 3, self.sky_tex);
         self.gl.enable(glow::SCISSOR_TEST);
         self.gl.enable(glow::BLEND);
         let alpha = 1. / (self.count + 1) as f32;
@@ -646,6 +705,26 @@ impl GlRenderer {
     unsafe fn end_sample_batch(&self) {
         self.gl.disable(glow::SCISSOR_TEST);
         self.gl.disable(glow::BLEND);
+    }
+
+    // During a frozen export tile only the random sequence changes per sample.
+    // Keep this shared with the ordinary path so call order remains identical.
+    unsafe fn advance_sample_uniforms(&mut self, pr: glow::Program, p: &RenderParams) {
+        let (full, _) = output_tile_mapping(self.output_tile, [p.width, p.height]);
+        let shortest = full[0].min(full[1]);
+        let jitter = if self.geo_tile.is_some() { [0., 0.] } else {
+            [(self.random()-0.5)*2./shortest, (self.random()-0.5)*2./shortest]
+        };
+        self.v2(pr, "pixel_jitter", jitter);
+        let segments=if p.experimental_bounces {101} else {16};
+        let dices: Vec<f32> = (0..segments*4).map(|_| self.random()).collect();
+        let lobes: Vec<f32> = (0..segments*2).map(|_| self.random()).collect();
+        self.gl.uniform_4_f32_slice(self.gl.get_uniform_location(pr, "dices[0]").as_ref(), &dices);
+        self.gl.uniform_2_f32_slice(self.gl.get_uniform_location(pr, "lobes[0]").as_ref(), &lobes);
+        let sun_r = [self.random(), self.random()];
+        self.v2(pr, "sun_r", sun_r);
+        let env_r = self.random();
+        self.f(pr, "env_r", env_r);
     }
 
     unsafe fn prepare_sample(&mut self) -> Result<(), String> {
@@ -677,35 +756,9 @@ impl GlRenderer {
         self.i(pr, "output_tiled", i32::from(self.output_tile.is_some()));
         let shortest = full[0].min(full[1]);
         self.v2(pr, "aspect", [full[0] / shortest, full[1] / shortest]);
-        let jitter = if self.geo_tile.is_some() {
-            [0., 0.]
-        } else {
-            [
-                (self.random() - 0.5) * 2. / shortest,
-                (self.random() - 0.5) * 2. / shortest,
-            ]
-        };
-        self.v2(pr, "pixel_jitter", jitter);
+        self.advance_sample_uniforms(pr, &p);
         self.v2(pr, "tex_rand_inv_size", [1. / 256., 1. / 256.]);
-        self.v4(
-            pr,
-            "jitter_mult",
-            [0.7548777, 0.5698403, 0.4382891, 0.328173],
-        );
-        let dices: Vec<f32> = (0..64).map(|_| self.random()).collect();
-        let lobes: Vec<f32> = (0..32).map(|_| self.random()).collect();
-        self.gl.uniform_4_f32_slice(
-            self.gl.get_uniform_location(pr, "dices[0]").as_ref(),
-            &dices,
-        );
-        self.gl.uniform_2_f32_slice(
-            self.gl.get_uniform_location(pr, "lobes[0]").as_ref(),
-            &lobes,
-        );
-        let sun_r = [self.random(), self.random()];
-        self.v2(pr, "sun_r", sun_r);
-        let env_r = self.random();
-        self.f(pr, "env_r", env_r);
+        self.v4(pr, "jitter_mult", [0.7548777, 0.5698403, 0.4382891, 0.328173]);
         let logical_width = map_width + if self.geo_tile.is_some() { 2 } else { 0 };
         let logical_height = map_height + if self.geo_tile.is_some() { 2 } else { 0 };
         self.v2(pr, "geo_source_size", [map_width as f32, map_height as f32]);
@@ -766,7 +819,7 @@ impl GlRenderer {
             pr,
             "mipmap_lod",
             [
-                if self.geo_tile.is_some() || p.surface == "bicubic" {
+                if self.paged_geometry || self.geo_tile.is_some() || p.surface == "bicubic" {
                     0.
                 } else {
                     p.lod.clamp(0, self.levels as i32) as f32
@@ -828,6 +881,7 @@ impl GlRenderer {
             self.color_size.map(|v| v as f32),
         );
         self.v2(pr, "appearance_height", [offset, vertical]);
+        self.f(pr, "height_curve", effective_height_curve(&p));
         self.f(
             pr,
             "appearance_origin",
@@ -837,7 +891,23 @@ impl GlRenderer {
         self.v2(pr, "cmap_scale", [1., 1.]);
         self.v2(pr, "cmap_offset", [0., 0.]);
         self.f(pr, "cmap_gamma", 1.);
-        self.i(pr, "max_num_diffuse", 8);
+        if p.sky_model == "atmosphere" && self.sky_altitude != Some(p.sun_altitude) {
+            let lut = super::sky::SkyLut::new(p.sun_altitude);
+            self.gl.active_texture(glow::TEXTURE0 + 3);
+            self.gl.bind_texture(glow::TEXTURE_2D, Some(self.sky_tex));
+            self.gl.tex_image_2d(
+                glow::TEXTURE_2D, 0, glow::RGB32F as i32,
+                super::sky::SKY_WIDTH as i32, super::sky::SKY_HEIGHT as i32, 0,
+                glow::RGB, glow::FLOAT, glow::PixelUnpackData::Slice(Some(bytes(&lut.pixels))),
+            );
+            self.texture_filter(glow::LINEAR, glow::CLAMP_TO_EDGE);
+            self.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::REPEAT as i32);
+            self.sky_altitude = Some(lut.altitude);
+            self.sky_mean = lut.mean_rgb;
+        }
+        self.i(pr, "sky_model", i32::from(p.sky_model == "atmosphere"));
+        self.f(pr, "sky_azimuth", p.sun_azimuth.to_radians());
+        self.i(pr, "max_num_diffuse", p.max_bounces as i32);
         self.i(pr, "max_num_specular", 0);
         self.i(pr, "max_num_scatter", 0);
         self.f(pr, "clamp_L", 10.);
@@ -846,10 +916,19 @@ impl GlRenderer {
         self.v4(pr, "surf_mask_diffuse", [1., 1., 0., 0.]);
         let sky = parse_color(&p.sky_color)?.map(|v| v * p.sky_intensity / 100. * 0.1);
         self.v3(pr, "Le", sky);
+        self.v3(pr, "sky_mean_radiance", std::array::from_fn(|i|
+            sky[i] * if p.sky_model == "atmosphere" {self.sky_mean[i]} else {1.}));
+        let transmission = if p.sky_model == "atmosphere" {
+            super::sky::direct_sun_transmittance(p.sun_altitude)
+        } else { [1.; 3] };
+        let sun_color = parse_color(&p.sun_color)?;
+        let solar_cosine=super::sky::sun_mean_cosine(p.sun_altitude,p.sun_size);
+        self.v3(pr,"sun_mean_radiance",std::array::from_fn(|i|
+            sun_color[i]*transmission[i]*p.sun_intensity/100.*0.4*solar_cosine/std::f32::consts::PI));
         self.v3(
             pr,
             "sun_I",
-            parse_color(&p.sun_color)?.map(|v| v * p.sun_intensity / 100. * 0.4),
+            std::array::from_fn(|i| sun_color[i] * transmission[i] * p.sun_intensity / 100. * 0.4),
         );
         let az = p.sun_azimuth.to_radians();
         let alt = p.sun_altitude.to_radians();
@@ -964,19 +1043,30 @@ impl GlRenderer {
 
     /// Export-only filters never enter native viewport presentation or raw capture.
     pub unsafe fn export_pixels(&self) -> Result<Vec<u8>, String> {
+        self.export_pixels_depth(8)
+    }
+    /// File exports retain the selected code precision; previews always use u8.
+    pub unsafe fn export_pixels_for_output(&self) -> Result<Vec<u8>, String> {
+        self.export_pixels_depth(self.params.output_bit_depth)
+    }
+    unsafe fn export_pixels_depth(&self, depth: u8) -> Result<Vec<u8>, String> {
         let export_pass = needs_export_pass(&self.params,self.geo_tile.is_some());
         if self.output_dirty.get() || export_pass {
             self.postprocess_output(export_pass);
         }
-        let result = self.pixels();
+        let result = self.pixels_depth(depth);
         // Preserve the pre-existing capture contract for legacy filters and
         // transparent-shadow alpha. Ordinary exports need only the final pass.
         if export_pass { self.postprocess(); }
         result
     }
     pub unsafe fn pixels(&self) -> Result<Vec<u8>, String> {
+        self.pixels_depth(8)
+    }
+    unsafe fn pixels_depth(&self, depth: u8) -> Result<Vec<u8>, String> {
         let (w, h) = (self.params.width as usize, self.params.height as usize);
-        let mut out = vec![0; w * h * 4];
+        let bytes = usize::from(depth / 8);
+        let mut out = vec![0; w * h * 4 * bytes];
         self.gl
             .bind_framebuffer(glow::FRAMEBUFFER, Some(if self.params.stretch_type != "none" { self.filtered_fbo } else { self.output_fbo }));
         self.gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
@@ -986,11 +1076,12 @@ impl GlRenderer {
             w as i32,
             h as i32,
             glow::RGBA,
-            glow::UNSIGNED_BYTE,
+            if depth == 16 { glow::UNSIGNED_SHORT } else { glow::UNSIGNED_BYTE },
             glow::PixelPackData::Slice(Some(&mut out)),
         );
         self.check("图像读回")?;
-        let row = w * 4;
+        clear_transparent_rgb(&mut out, depth);
+        let row = w * 4 * bytes;
         for y in 0..h / 2 {
             let (a, b) = out.split_at_mut((h - 1 - y) * row);
             a[y * row..(y + 1) * row].swap_with_slice(&mut b[..row]);
@@ -1029,13 +1120,16 @@ impl GlRenderer {
         }
     }
     unsafe fn allocate(&mut self) -> Result<(), String> {
+        let high = self.params.output_bit_depth == 16;
+        let output_format = if high { glow::RGBA16 } else { glow::RGBA8 };
+        let output_kind = if high { glow::UNSIGNED_SHORT } else { glow::UNSIGNED_BYTE };
         for (tex, fbo, format, kind) in [
             (self.accum, self.accum_fbo, glow::RGBA32F, glow::FLOAT),
             (
                 self.output,
                 self.output_fbo,
-                glow::RGBA8,
-                glow::UNSIGNED_BYTE,
+                output_format,
+                output_kind,
             ),
         ] {
             self.gl.bind_texture(glow::TEXTURE_2D, Some(tex));
@@ -1070,8 +1164,8 @@ impl GlRenderer {
         let enabled = needs_surface(&self.params);
         for (tex, fbo, w, h, format, kind) in [
             (self.surface_info,self.surface_fbo,if enabled {self.params.width} else {1},if enabled {self.params.height} else {1},glow::RGBA32F,glow::FLOAT),
-            (self.filtered,self.filtered_fbo,if self.params.stretch_type != "none" {self.params.width} else {1},if self.params.stretch_type != "none" {self.params.height} else {1},glow::RGBA8,glow::UNSIGNED_BYTE),
-            (self.stats_tex,self.stats_fbo,256,256,glow::RGBA8,glow::UNSIGNED_BYTE),
+            (self.filtered,self.filtered_fbo,if self.params.stretch_type != "none" {self.params.width} else {1},if self.params.stretch_type != "none" {self.params.height} else {1},output_format,output_kind),
+            (self.stats_tex,self.stats_fbo,256,256,output_format,output_kind),
         ] {
             self.gl.bind_texture(glow::TEXTURE_2D,Some(tex));
             self.texture_filter(glow::NEAREST,glow::CLAMP_TO_EDGE);
@@ -1082,7 +1176,10 @@ impl GlRenderer {
         }
         self.gl.bind_texture(glow::TEXTURE_2D,Some(self.lut_tex));
         self.texture_filter(glow::LINEAR,glow::CLAMP_TO_EDGE);
-        self.gl.tex_image_2d(glow::TEXTURE_2D,0,glow::RGB8 as i32,256,1,0,glow::RGB,glow::UNSIGNED_BYTE,glow::PixelUnpackData::Slice(Some(&stretch::build_lut(&[],None,"none",2.,2.,2.))));
+        // RGBA16 and the full precision LUT avoid any intermediate 8-bit bottleneck.
+        let identity = if high { u16_bytes(&stretch::build_lut16(&[],None,"none",2.,2.,2.)) }
+            else { stretch::build_lut(&[],None,"none",2.,2.,2.) };
+        self.gl.tex_image_2d(glow::TEXTURE_2D,0,if high {glow::RGB16} else {glow::RGB8} as i32,256,if high {256} else {1},0,glow::RGB,output_kind,glow::PixelUnpackData::Slice(Some(&identity)));
         self.reset();
         self.check("分配渲染缓冲")
     }
@@ -1108,6 +1205,18 @@ impl GlRenderer {
         self.postprocess_output(false);
     }
     unsafe fn postprocess_output(&self, export: bool) {
+        if self.params.contour_enabled && !self.contour_ready.get() {
+            if let Some(map)=self.map {
+                // Reuse the unwarped cached height field; default-off scenes
+                // never allocate a second full-size source texture or CPU copy.
+                let data=contour_source_pixels(&self.height_base,[map.width,map.height],self.padded);
+                self.gl.bind_texture(glow::TEXTURE_2D,Some(self.contour_tex));
+                self.texture_filter(glow::LINEAR,glow::CLAMP_TO_EDGE);
+                self.gl.tex_image_2d(glow::TEXTURE_2D,0,glow::RG32F as i32,map.width as i32,map.height as i32,
+                    0,glow::RG,glow::FLOAT,glow::PixelUnpackData::Slice(Some(bytes(&data))));
+                self.contour_ready.set(true);
+            }
+        }
         if needs_surface(&self.params) && !self.surface_ready.get() {
             self.gl.bind_framebuffer(glow::FRAMEBUFFER,Some(self.surface_fbo));
             self.gl.viewport(0,0,self.params.width as i32,self.params.height as i32);
@@ -1167,6 +1276,18 @@ impl GlRenderer {
         self.v2(p,"workflow_texture_size",[self.color_size[0].max(1) as f32,self.color_size[1].max(1) as f32]);
         self.i(p,"texture_overlay_enabled",i32::from(self.params.appearance_mode=="texture"));
         self.f(p,"texture_opacity",self.params.texture_opacity/100.);
+        self.bind_tex(p,"contour_source",6,self.contour_tex);
+        self.v2(p,"contour_source_size",self.map.map(|m|[m.width as f32,m.height as f32]).unwrap_or([1.,1.]));
+        self.v2(p,"contour_source_step",self.map.map(|m|contour_reference_step(m.source_size)).unwrap_or([1.,1.]));
+        self.f(p,"contour_smoothing",self.params.contour_smoothing);
+        self.i(p,"contour_enabled",i32::from(self.params.contour_enabled));
+        self.v2(p,"contour_elevation",contour_levels(self.map.map(|m|m.source_elevation).unwrap_or([0.,0.]),self.params.contour_interval,self.params.contour_major_every));
+        self.f(p,"contour_interval",self.params.contour_interval);
+        self.f(p,"contour_width",self.params.contour_width);
+        self.f(p,"contour_opacity",self.params.contour_opacity/100.);
+        self.f(p,"contour_major_every",self.params.contour_major_every as f32);
+        self.f(p,"contour_major_width",self.params.contour_major_width);
+        self.v3(p,"contour_color",parse_color(&self.params.contour_color).unwrap_or([0.;3]));
         for (name,value) in display_uniforms(&self.params) { self.f(p,name,value); }
         if export {
             self.i(p,"output_filter_enabled",i32::from(self.params.stretch_type=="none"));
@@ -1235,14 +1356,14 @@ impl GlRenderer {
 
 impl GlRenderer {
     // Statistics readback is capped at 256² pixels, independently of source/output size.
-    unsafe fn statistics_pixels(&self, source: glow::Framebuffer) -> Vec<u8> {
+    unsafe fn statistics_pixels(&self, source: glow::Framebuffer, high: bool) -> Vec<u8> {
         self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER,Some(source));
         self.gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER,Some(self.stats_fbo));
         self.gl.blit_framebuffer(0,0,self.params.width as i32,self.params.height as i32,0,0,256,256,glow::COLOR_BUFFER_BIT,glow::NEAREST);
         self.gl.bind_framebuffer(glow::FRAMEBUFFER,Some(self.stats_fbo));
-        let mut pixels=vec![0;256*256*4];
+        let mut pixels=vec![0;256*256*4*if high {2} else {1}];
         self.gl.pixel_store_i32(glow::PACK_ALIGNMENT,1);
-        self.gl.read_pixels(0,0,256,256,glow::RGBA,glow::UNSIGNED_BYTE,glow::PixelPackData::Slice(Some(&mut pixels)));
+        self.gl.read_pixels(0,0,256,256,glow::RGBA,if high {glow::UNSIGNED_SHORT} else {glow::UNSIGNED_BYTE},glow::PixelPackData::Slice(Some(&mut pixels)));
         pixels
     }
     unsafe fn apply_stretch(&self, export: bool) {
@@ -1250,22 +1371,28 @@ impl GlRenderer {
             && (export != self.stretch_export.get() || (self.stretch_count.get()!=self.count
                 && (self.count.is_power_of_two() || self.count==self.params.samples))));
         if refresh {
-            let colors=self.statistics_pixels(self.output_fbo);
-            let mask:Vec<u8>=self.statistics_pixels(self.surface_fbo).chunks_exact(4).map(|p|p[1]).collect();
-            let lut=stretch::build_lut(&colors,Some(&mask),&self.params.stretch_type,self.params.stretch_deviations,self.params.stretch_low,self.params.stretch_high);
+            let high=self.params.output_bit_depth==16;
+            let colors=self.statistics_pixels(self.output_fbo,high);
+            let mask:Vec<u8>=self.statistics_pixels(self.surface_fbo,false).chunks_exact(4).map(|p|p[1]).collect();
+            let lut=if high {
+                let words:Vec<u16>=colors.chunks_exact(2).map(|p|u16::from_ne_bytes([p[0],p[1]])).collect();
+                u16_bytes(&stretch::build_lut16(&words,Some(&mask),&self.params.stretch_type,self.params.stretch_deviations,self.params.stretch_low,self.params.stretch_high))
+            } else {stretch::build_lut(&colors,Some(&mask),&self.params.stretch_type,self.params.stretch_deviations,self.params.stretch_low,self.params.stretch_high)};
             self.stretch_lut.replace(Some(lut));
             self.stretch_count.set(self.count);self.stretch_export.set(export);
         }
         self.gl.bind_texture(glow::TEXTURE_2D,Some(self.lut_tex));
         self.gl.pixel_store_i32(glow::UNPACK_ALIGNMENT,1);
         let lut=self.stretch_lut.borrow();
-        self.gl.tex_sub_image_2d(glow::TEXTURE_2D,0,0,0,256,1,glow::RGB,glow::UNSIGNED_BYTE,glow::PixelUnpackData::Slice(lut.as_deref()));
+        let high=self.params.output_bit_depth==16;
+        self.gl.tex_sub_image_2d(glow::TEXTURE_2D,0,0,0,256,if high {256} else {1},glow::RGB,if high {glow::UNSIGNED_SHORT} else {glow::UNSIGNED_BYTE},glow::PixelUnpackData::Slice(lut.as_deref()));
         self.gl.bind_framebuffer(glow::FRAMEBUFFER,Some(self.filtered_fbo));
         self.gl.viewport(0,0,self.params.width as i32,self.params.height as i32);
         self.gl.use_program(Some(self.stretch_program));
         self.bind_tex(self.stretch_program,"image",0,self.output);
         self.bind_tex(self.stretch_program,"surface_info",1,self.surface_info);
         self.bind_tex(self.stretch_program,"stretch_lut",2,self.lut_tex);
+        self.i(self.stretch_program,"stretch_high_precision",i32::from(high));
         self.v2(self.stretch_program,"image_size",[self.params.width as f32,self.params.height as f32]);
         self.i(self.stretch_program,"output_filter_enabled",i32::from(export));
         self.i(self.stretch_program,"export_shadow_matte",i32::from(self.geo_tile.is_some() && self.params.export_shadow));
@@ -1302,8 +1429,10 @@ impl Drop for GlRenderer {
             }
             for t in [
                 self.height_tex,
+                self.contour_tex,
                 self.rand_tex,
                 self.color_tex,
+                self.sky_tex,
                 self.accum,
                 self.output, self.surface_info, self.filtered, self.stats_tex, self.lut_tex,
             ] {
@@ -1446,11 +1575,11 @@ fn geo_grid_mapping(
     )
 }
 
-fn path_source(p: &RenderParams, geo: bool) -> String {
+pub(super) fn path_source(p: &RenderParams, geo: bool) -> String {
     let mut source = String::from(
-        "#version 330 compatibility\n#define OPT_SUN\n#define OPT_SUN_DISK\n#define OPT_LE\n",
+        "#version 330 compatibility\n#define OPT_SUN\n#define OPT_SUN_DISK\n",
     );
-    source.push_str("uniform int surface_pass;\n");
+    source.push_str("uniform int surface_pass;\nuniform float height_curve;\nfloat source_height(float t){if(height_curve==1.)return t;float q=clamp((t-1e-6)/(1.-1e-6),0.,1.);return (height_curve*q/((1.-q)+height_curve*q))*(1.-1e-6)+1e-6;}\n");
     source.push_str("uniform vec2 output_full_size,output_tile_origin;uniform int output_tiled;uniform vec2 pixel_jitter;\nvec2 output_pixel(){return gl_FragCoord.xy+(output_tiled!=0?output_tile_origin:vec2(0.));}\nvec2 output_st(vec2 original){if(output_tiled==0)return original;return (output_pixel()*2.-output_full_size)/min(output_full_size.x,output_full_size.y)+pixel_jitter;}\n");
     source.push_str(match p.surface.as_str() {
         "cube" => "#define PRIM_CUBE\n",
@@ -1484,6 +1613,14 @@ fn path_source(p: &RenderParams, geo: bool) -> String {
         include_str!("shaders/09_camera.glsl"),
         include_str!("shaders/11_path_tracing.glsl"),
     ] {
+        let block = if p.experimental_bounces {
+            block.replace("MAX_SEGMENTS=16", "MAX_SEGMENTS=101")
+                .replace("max_bounce=15", "max_bounce=100")
+        } else {block.to_string()};
+        let block = if block.contains("uniform vec3 Le;") {
+            block.replace("return Le;", "return scene_sky(dir);")
+                .replace("uniform vec3 Le;", &format!("uniform vec3 Le;\n{}\n", include_str!("sky_environment.glsl")))
+        } else { block.to_string() };
         let block = block
             .replace(
                 "gl_FragCoord.xy*tex_rand_inv_size",
@@ -1517,7 +1654,7 @@ fn path_source(p: &RenderParams, geo: bool) -> String {
             format!(
                 "{}\n{}\n{}",
                 &block[..start],
-                include_str!("appearance.glsl"),
+                include_str!("appearance.glsl").replace("float t=(p.z-appearance_height.x)/max(appearance_height.y,1e-12);", "float t=source_height((p.z-appearance_height.x)/max(appearance_height.y,1e-12));"),
                 &block[end..]
             )
         } else {
@@ -1554,7 +1691,7 @@ fn path_source(p: &RenderParams, geo: bool) -> String {
         source.push_str(&block);
         source.push('\n');
     }
-    source.replace("sample_ray(output_st(st),o,dir,A);", "sample_ray(output_st(st),o,dir,A);if(surface_pass!=0){float d=INF;vec3 n=vec3(0.);vec2 id=ray_vs_world(o,dir,d,n);if(is_map(id.y)&&!is_n_zero(n)){float t=(o.z+dir.z*d-appearance_height.x)/max(appearance_height.y,1e-12);vec2 tex_st=clamp((o.xy+dir.xy*d-vec2(appearance_origin))/max(appearance_extent-1.,vec2(1.)),0.,1.);gl_FragColor=vec4(clamp(t,0.,1.),1.,tex_st);}else gl_FragColor=vec4(0.);return;}")
+    source.replace("sample_ray(output_st(st),o,dir,A);", "sample_ray(output_st(st),o,dir,A);if(surface_pass!=0){float d=INF;vec3 n=vec3(0.);vec2 id=ray_vs_world(o,dir,d,n);if(is_map(id.y)&&!is_n_zero(n)){float t=source_height((o.z+dir.z*d-appearance_height.x)/max(appearance_height.y,1e-12));vec2 tex_st=clamp((o.xy+dir.xy*d-vec2(appearance_origin))/max(appearance_extent-1.,vec2(1.)),0.,1.);gl_FragColor=vec4(clamp(t,0.,1.),1.,tex_st);}else gl_FragColor=vec4(0.);return;}")
 }
 fn copy_display_fields(from: &RenderParams,to: &mut RenderParams) {
     to.exposure=from.exposure;
@@ -1573,6 +1710,13 @@ fn copy_display_fields(from: &RenderParams,to: &mut RenderParams) {
     to.texture_highlights=from.texture_highlights;
     to.texture_saturation=from.texture_saturation;
     to.texture_opacity=from.texture_opacity;
+    to.contour_interval=from.contour_interval;
+    to.contour_width=from.contour_width;
+    to.contour_smoothing=from.contour_smoothing;
+    to.contour_color=from.contour_color.clone();
+    to.contour_opacity=from.contour_opacity;
+    to.contour_major_every=from.contour_major_every;
+    to.contour_major_width=from.contour_major_width;
     to.output_contrast=from.output_contrast;
     to.output_saturation=from.output_saturation;
     to.output_temperature=from.output_temperature;
@@ -1584,8 +1728,55 @@ pub(super) fn same_scene_without_output_filter(old: &RenderParams, next: &Render
     copy_display_fields(old,&mut comparison);
     comparison == *old
 }
+fn u16_bytes(values: &[u16]) -> Vec<u8> {
+    values.iter().flat_map(|v|v.to_ne_bytes()).collect()
+}
+fn clear_transparent_rgb(pixels: &mut [u8], depth: u8) {
+    let bytes=usize::from(depth/8);
+    for p in pixels.chunks_exact_mut(4*bytes) {
+        if p[3*bytes..].iter().all(|v|*v==0) {p[..3*bytes].fill(0);}
+    }
+}
+fn contour_reference_step(size: [u32;2]) -> [f32;2] {
+    let base=(size[0].max(size[1]).saturating_sub(1) as f64/2047.).max(1.);
+    size.map(|axis|(base/f64::from(axis.saturating_sub(1).max(1))) as f32)
+}
+fn contour_source_pixels(encoded: &[f32],size: [u32;2],stride: u32) -> Vec<f32> {
+    let mut out=Vec::with_capacity(size[0] as usize*size[1] as usize*2);
+    for y in 0..size[1] as usize {
+        for x in 0..size[0] as usize {
+            let value=encoded[y*stride as usize+x];
+            let valid=if value>0. {1.}else{0.};
+            out.extend([if valid>0. {((value-1e-6)/(1.-1e-6)).clamp(0.,1.)}else{0.},valid]);
+        }
+    }
+    out
+}
+
+
+fn source_elevation_range(map: &HeightMap) -> [f64;2] {
+    if let Some([low,high])=map.source_elevation_range {return [low,(high-low).max(0.)];}
+    // Images supply relative brightness, not physical elevation. Use a stable
+    // 0..100 range independent of preview dimensions and legacy world scale.
+    [100.*f64::from(map.display_range[0]),100.*f64::from(map.display_range[1]-map.display_range[0])]
+}
+fn contour_levels([bottom,span]: [f64;2],interval: f32,major_every: u32) -> [f32;2] {
+    let interval=f64::from(interval);
+    [(bottom/interval).rem_euclid(f64::from(major_every)) as f32,(span/interval) as f32]
+}
+pub(crate) fn validate_contour_parameters(p: &RenderParams) -> Result<(),String> {
+    for (value,low,high) in [(p.contour_interval,0.01,1e6),(p.contour_width,0.1,30.),
+        (p.contour_major_width,0.1,30.),(p.contour_opacity,0.,100.),(p.contour_smoothing,0.,5.)] {
+        if !value.is_finite() || !(low..=high).contains(&value) {
+            return Err("等高线参数超出范围".into());
+        }
+    }
+    if !(1..=20).contains(&p.contour_major_every) {return Err("主等高线间隔超出范围".into());}
+    parse_color(&p.contour_color)?;
+    Ok(())
+}
 fn needs_surface(p: &RenderParams) -> bool {
-    p.stretch_type!="none" || elevation_color_blend(p) || p.appearance_mode=="texture"
+    p.stretch_type!="none" || elevation_color_blend(p) || p.appearance_mode=="texture" || p.contour_enabled
 }
 fn needs_export_pass(p: &RenderParams, georeferenced: bool) -> bool {
     !output_is_neutral(p) || (georeferenced && p.export_shadow)
@@ -1640,8 +1831,8 @@ fn filter_post_source(source: String) -> String {
             &format!("{}\nuniform int export_shadow_matte, output_filter_enabled;\nvoid main(){{", include_str!("output_filter.glsl")),
         )
         .replace(
-            "gl_FragColor.rgb=scene_filter(texture_display_overlay(gl_FragColor.rgb,uv));",
-            "gl_FragColor.rgb=scene_filter(texture_display_overlay(gl_FragColor.rgb,uv));if(output_filter_enabled!=0)gl_FragColor.rgb=output_filter(gl_FragColor.rgb);if(export_shadow_matte!=0&&all(equal(texture2D(tex_accum,uv).rgb,vec3(0.))))gl_FragColor.rgb=vec3(0.);",
+            "gl_FragColor.rgb=scene_filter(contour_display(texture_display_overlay(gl_FragColor.rgb,uv),uv));",
+            "gl_FragColor.rgb=scene_filter(contour_display(texture_display_overlay(gl_FragColor.rgb,uv),uv));if(output_filter_enabled!=0)gl_FragColor.rgb=output_filter(gl_FragColor.rgb);if(export_shadow_matte!=0&&all(equal(texture2D(tex_accum,uv).rgb,vec3(0.))))gl_FragColor.rgb=vec3(0.);",
         )
 }
 
@@ -1657,7 +1848,7 @@ fn post_source(color_mode: bool) -> String {
             .replace("dst.xyz=pow(post(dst.xyz),vec3(gamma));","dst.xyz=relief_display(dst.xyz);")
     } else { original.to_owned() };
     let source=source.replace("void main(){",&format!("{}\nvoid main(){{",include_str!("display_workflow.glsl")))
-        .replace("gl_FragColor=mix(src,dst,weight);","gl_FragColor=mix(src,dst,weight);gl_FragColor.rgb=scene_filter(texture_display_overlay(gl_FragColor.rgb,uv));");
+        .replace("gl_FragColor=mix(src,dst,weight);","gl_FragColor=mix(src,dst,weight);gl_FragColor.rgb=scene_filter(contour_display(texture_display_overlay(gl_FragColor.rgb,uv),uv));");
     format!("#version 330 compatibility\n{source}")
 }
 
@@ -1740,6 +1931,22 @@ fn display_sample(value: f32, [minimum, maximum]: [f32; 2]) -> f32 {
     };
     q * (1. - 1e-6) + 1e-6
 }
+fn effective_height_curve(p: &RenderParams) -> f32 {
+    if p.height_scale_mode == "nonlinear" { p.height_curve } else { 1. }
+}
+
+fn curved_height_texture(base: &[f32], curve: f32) -> Vec<f32> {
+    if curve == 1. { return base.to_vec(); }
+    base.iter().map(|&value| {
+        // Zero is NoData; valid valley pixels retain the positive sentinel.
+        if value == 0. { return 0.; }
+        let q = ((value - 1e-6) / (1. - 1e-6)).clamp(0., 1.);
+        // Combined with the amplitude multiplier, s*t/(s*(1-t)+t)
+        // grows monotonically with s at every elevation. A power curve
+        // would instead lower mid-elevation terrain at larger values.
+        (q / (curve * (1. - q) + q)) * (1. - 1e-6) + 1e-6
+    }).collect()
+}
 fn padded_height_texture(map: &HeightMap, size: u32) -> Vec<f32> {
     let mut data = vec![0.; size as usize * size as usize];
     for y in 0..size {
@@ -1770,7 +1977,3 @@ fn camera_basis(yaw: f32, pitch: f32) -> [f32; 9] {
 fn bytes(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
-
-
-
-

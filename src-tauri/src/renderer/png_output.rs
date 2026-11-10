@@ -27,19 +27,42 @@ pub fn write<F>(path: &Path, width: u32, height: u32, tile: F) -> Result<(), Str
 where
     F: FnMut(u32, u32, u32, u32) -> Result<Vec<u8>, String>,
 {
-    write_with_compression(path, width, height, tile, Encoding::LevelOne)
+    write_depth(path, width, height, 8, tile)
 }
 
-fn write_with_compression<F>(
+/// RGBA16 callbacks return native-endian u16 samples; PNG serializes them big-endian.
+pub fn write_depth<F>(
     path: &Path,
     width: u32,
     height: u32,
+    depth: u8,
+    tile: F,
+) -> Result<(), String>
+where
+    F: FnMut(u32, u32, u32, u32) -> Result<Vec<u8>, String>,
+{
+    write_depth_with_compression(path, width, height, depth, tile, Encoding::LevelOne)
+}
+
+
+
+fn write_depth_with_compression<F>(
+    path: &Path,
+    width: u32,
+    height: u32,
+    depth: u8,
     mut tile: F,
     compression: Encoding,
 ) -> Result<(), String>
 where
     F: FnMut(u32, u32, u32, u32) -> Result<Vec<u8>, String>,
 {
+    let sample_bytes = match depth {
+        8 => 1usize,
+        16 => 2,
+        _ => return Err("PNG 位深必须为 8 或 16".into()),
+    };
+    let pixel_bytes = 4 * sample_bytes;
     if width == 0 || height == 0 || width > MAX_EDGE || height > MAX_EDGE {
         return Err("PNG 输出尺寸超出范围".into());
     }
@@ -64,7 +87,13 @@ where
         .ok_or("无法分配 PNG 临时文件")??;
     let mut encoder = png::Encoder::new(BufWriter::new(file), width, height);
     encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_depth(if depth == 16 {
+        png::BitDepth::Sixteen
+    } else {
+        png::BitDepth::Eight
+    });
+    encoder.set_source_srgb(png::SrgbRenderingIntent::RelativeColorimetric);
+    encoder.set_source_gamma(png::ScaledFloat::from_scaled(45455));
     match compression {
         
                 // Adaptive row filtering is retained. Deflate level 1 preserves all
@@ -73,21 +102,29 @@ where
     }
     let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
     let mut stream = writer.stream_writer().map_err(|e| e.to_string())?;
-    let stride = width as usize * 4;
+    let stride = width as usize * pixel_bytes;
     let strip_rows = STRIP_HEIGHT.min((MAX_STRIP_BYTES / stride) as u32).max(1);
+    // Keep derivative quads aligned between strips for screen-space contours.
+    let strip_rows = if strip_rows>1 {strip_rows & !1} else {1};
     for y in (0..height).step_by(strip_rows as usize) {
         let rows = strip_rows.min(height - y);
         let mut strip = vec![0; stride * rows as usize];
         for x in (0..width).step_by(TILE_WIDTH as usize) {
             let cols = TILE_WIDTH.min(width - x);
             let bytes = tile(x, y, cols, rows)?;
-            let tile_stride = cols as usize * 4;
+            let tile_stride = cols as usize * pixel_bytes;
             if bytes.len() != tile_stride * rows as usize {
                 return Err("PNG 渲染分块尺寸无效".into());
             }
             for row in 0..rows as usize {
-                strip[row * stride + x as usize * 4..row * stride + (x + cols) as usize * 4]
+                strip[row * stride + x as usize * pixel_bytes
+                    ..row * stride + (x + cols) as usize * pixel_bytes]
                     .copy_from_slice(&bytes[row * tile_stride..(row + 1) * tile_stride]);
+            }
+        }
+        if depth == 16 {
+            for sample in strip.chunks_exact_mut(2) {
+                sample.copy_from_slice(&u16::from_ne_bytes([sample[0], sample[1]]).to_be_bytes());
             }
         }
         stream.write_all(&strip).map_err(|e| e.to_string())?;
@@ -97,5 +134,3 @@ where
     fs::rename(&pending.0, path).map_err(|e| format!("完成 PNG 文件失败：{e}"))?;
     Ok(())
 }
-
-

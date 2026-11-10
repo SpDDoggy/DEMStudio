@@ -132,3 +132,9 @@ select{color:#f0f5fc;background-color:#243246;color-scheme:dark}select option{co
 .export-job progress::-webkit-progress-value{background:#91b7ee;border-radius:8px;transition:width .2s ease}
 .export-job progress::-moz-progress-bar{background:#91b7ee;border-radius:8px}
 .window-square .window-edge{border-radius:0}
+.render-presets{padding-bottom:14px;border-bottom:1px solid var(--edge);margin-bottom:12px}.render-presets>input{width:100%;box-sizing:border-box;background:#1d2939;color:#edf3fc;border:1px solid var(--edge);border-radius:7px;padding:8px 10px}.preset-actions{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}.preset-actions button{flex:1;padding:7px 5px;white-space:nowrap}
+.bounce-test-notice{position:fixed;left:20px;bottom:20px;z-index:30;padding:10px 14px;border-radius:10px;color:#e9f1fb;font-size:12px;pointer-events:none}
+.field input.toggle-input{appearance:none;width:36px;height:21px;border-radius:20px;border:1px solid #ffffff26;padding:2px;background:#172332;cursor:pointer;position:relative}
+.field input.toggle-input::before{content:'';display:block;width:15px;height:15px;border-radius:50%;background:#9baabd;transition:transform .12s,background .12s}
+.field input.toggle-input:checked{background:#365c87;border-color:#91b7ee66}
+.field input.toggle-input:checked::before{transform:translateX(14px);background:#dceaff}

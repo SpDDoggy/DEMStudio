@@ -28,10 +28,13 @@ export const fields = {
   sunAltitude: { label: '高度角', value: 45, min: 0, max: 90, step: 1 },
   sunAzimuth: { label: '方位角', value: 135, min: 0, max: 360, step: 1 },
   sunSize: { label: '面积', value: 1, min: .1, max: 100, step: .1 },
-  sunIntensity: { label: '强度', value: 100, min: 0, max: 500, step: 1 },
+  sunIntensity: { label: '太阳强度', value: 100, min: 0, max: 500, step: 1 },
   sunColor: { label: '颜色', value: '#fff1db', type: 'color' },
-  skyIntensity: { label: '强度', value: 100, min: 0, max: 500, step: 1 },
+  skyModel: { label: '天空模型', value: 'atmosphere', options: { atmosphere: '大气天空', constant: '恒色天空' } },
+  skyIntensity: { label: '天光强度', value: 45, min: 0, max: 500, step: 1 },
   skyColor: { label: '颜色', value: '#a9c9e8', type: 'color' },
+  maxBounces: { label: '最大反弹次数', value: 8, min: 1, max: 100, step: 1 },
+  experimentalBounces: { value: false, type: 'boolean' },
   fogDensity: { label: '密度', value: 0, min: 0, max: 100, step: .1 },
   cameraYaw: { label: '方位', value: 45, min: -180, max: 180, step: 1 },
   cameraPitch: { label: '俯仰', value: 35, min: 0, max: 90, step: 1 },
@@ -64,7 +67,16 @@ export const fields = {
   stretchLow: { label: '低端 (%)', value: 2, min: 0, max: 49, step: .1 },
   stretchHigh: { label: '高端 (%)', value: 2, min: 0, max: 49, step: .1 },
   elevationBlend: { label: '混合', value: 'color', options: { normal: '常规', color: '颜色' } },
-  heightScale: { label: '缩放', value: 1, min: .1, max: 100, step: .1 },
+  heightScaleMode: { label: '缩放模式', value: 'linear', options: { linear: '线性', accelerated: '参数加速', nonlinear: '高程非线性' } },
+  heightScale: { label: '缩放', value: 1, min: .1, max: 500, step: .1 },
+  contourEnabled: { label: '显示', value: false, type: 'boolean' },
+  contourInterval: { label: '间距', value: 5, min: .01, max: 1000000, step: .01, range: false },
+  contourWidth: { label: '线宽', value: .65, min: .1, max: 30, step: .05 },
+  contourSmoothing: { label: '平滑', value: 1, min: 0, max: 5, step: .1 },
+  contourColor: { label: '颜色', value: '#6b6258', type: 'color' },
+  contourOpacity: { label: '不透明度', value: 45, min: 0, max: 100, step: 1 },
+  contourMajorEvery: { label: '主线间隔', value: 5, min: 1, max: 20, step: 1, range: false },
+  contourMajorWidth: { label: '主线宽', value: 1.1, min: .1, max: 30, step: .05 },
   heightOffset: { label: '偏移', value: 0, min: 0, max: 100, step: 1 },
   heightStep: { label: '量化', value: 0, min: 0, max: 100000, step: .1, range: false },
   lod: { label: '细节层级', value: 0, min: 0, max: 14, step: 1 },
@@ -79,6 +91,8 @@ export const fields = {
   materialColor: { label: '颜色', value: '#d5d2c9', type: 'color' },
   width: { label: '宽度', value: 1920, min: 1, max: 243600, step: 1, range: false },
   height: { label: '高度', value: 1080, min: 1, max: 243600, step: 1, range: false },
+  exportTerrainScale: { label: '地形精度', value: 'source', options: { source: '原始', half: '1/2', quarter: '1/4', preview: '预览' } },
+  outputBitDepth: { label: '位深', value: 8, min: 8, max: 16, step: 8 },
   samples: { label: '采样', value: 256, min: 1, max: 65536, step: 1, range: false },
   projection: { value: 'perspective', options: { perspective: '透视', orthographic: '正交', isometric: '等轴' } },
   grid: { value: true, type: 'boolean' },
@@ -98,6 +112,7 @@ export function createSceneState() {
 
 export function normalizeParameter(key, value) {
   const field = fields[key];
+  if (key === 'outputBitDepth' && ![8,16].includes(value)) throw new Error('位深无效');
   if (!field) throw new Error('未知参数');
   if (field.type === 'color5') {
     if (!Array.isArray(value) || value.length !== 5 || !Array.from(value).every(color => typeof color === 'string' && /^#[0-9a-f]{6}$/i.test(color))) throw new Error('色带无效');

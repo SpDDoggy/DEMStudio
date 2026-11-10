@@ -3,9 +3,19 @@
 // The existing conservative mip texture is queried with an expanded footprint.
 uniform vec2 bc_source_size;
 uniform vec2 bc_source_offset;
-float bc_raw(vec2 logical){
+// A leaf bound and its accepted patch use the same raw LOD0 footprint.
+// Cache before height scaling/quantization so both original operation orders stay intact.
+float bc_leaf_samples[16];
+vec2 bc_leaf_cell,bc_leaf_lo;
+bool bc_leaf_ready=false;
+float bc_raw(vec2 logical,bool reuse){
     vec2 p=clamp(logical-bc_source_offset,vec2(0.),bc_source_size-vec2(1.));
-    float h=texture2DLod(mipmap,(p+vec2(.5))*mipmap_tex_inv_size,0.).x*mipmap_size.z;
+    float raw;
+    if(reuse){
+        ivec2 index=ivec2(p-bc_leaf_lo);
+        raw=bc_leaf_samples[index.y*4+index.x];
+    }else raw=texture2DLod(mipmap,(p+vec2(.5))*mipmap_tex_inv_size,0.).x;
+    float h=raw*mipmap_size.z;
 #ifdef OPT_LEVEL
     h=ceil(h/mipmap_step)*mipmap_step;
 #endif
@@ -17,6 +27,8 @@ float bc_bound(vec2 p,float lod){
     vec2 lo=clamp(cell-vec2(1.)-bc_source_offset,vec2(0.),bc_source_size-vec2(1.));
     vec2 hi=clamp(cell+vec2(scale+1.)-bc_source_offset,vec2(0.),bc_source_size-vec2(1.));
     lo=floor(lo/scale);hi=floor(hi/scale);
+    bc_leaf_ready=lod==0.;
+    if(bc_leaf_ready){bc_leaf_cell=cell;bc_leaf_lo=lo;}
     float h=0.;
     // At level 0 this is a 4x4 footprint; at higher levels at most 3x3.
     for(int y=0;y<4;y++)for(int x=0;x<4;x++){
@@ -24,7 +36,9 @@ float bc_bound(vec2 p,float lod){
         vec2 index=lo+vec2(x,y);
         if(any(greaterThan(index,hi)))continue;
         vec2 q=index*scale;
-        h=max(h,texture2DLod(mipmap,(q+vec2(.5))*mipmap_tex_inv_size,lod).x);
+        float raw=texture2DLod(mipmap,(q+vec2(.5))*mipmap_tex_inv_size,lod).x;
+        if(bc_leaf_ready)bc_leaf_samples[y*4+x]=raw;
+        h=max(h,raw);
     }
     h*=mipmap_size.z;
 #ifdef OPT_LEVEL
@@ -37,9 +51,10 @@ vec4 bc_to_bezier(vec4 p){
                 (p.y+2.*p.z)/3.,(p.y+4.*p.z+p.w)/6.);
 }
 void bc_patch(vec2 cell,out float p[16]){
+    bool reuse=bc_leaf_ready&&all(equal(cell,bc_leaf_cell));
     for(int y=0;y<4;y++){
         vec4 row;
-        for(int x=0;x<4;x++)row[x]=bc_raw(cell+vec2(x-1,y-1));
+        for(int x=0;x<4;x++)row[x]=bc_raw(cell+vec2(x-1,y-1),reuse);
         row=bc_to_bezier(row);
         for(int x=0;x<4;x++)p[y*4+x]=row[x];
     }

@@ -17,6 +17,7 @@ pub fn demo() -> HeightMap {
         height: size as u32,
         values,
         display_range: [0., 1.],
+        source_elevation_range: None,
         bottom: 0.,
         span: 60.,
         name: "内置地形".into(),
@@ -27,7 +28,7 @@ fn dimensions(w: u32, h: u32) -> Result<(), String> {
     super::raster::dimensions(w, h)
 }
 pub fn load(path: &Path) -> Result<HeightMap, String> {
-    super::raster::load(path, super::raster::PREVIEW_EDGE)
+    super::raster::load_preview(path)
 }
 fn normalize(
     width: u32,
@@ -37,6 +38,8 @@ fn normalize(
     name: String,
 ) -> Result<HeightMap, String> {
     dimensions(width, height)?;
+    let extrema=values.iter().copied().map(|v|if v.is_finite(){v.max(0.)}else{0.})
+        .fold([f32::INFINITY,f32::NEG_INFINITY],|r,v|[r[0].min(v),r[1].max(v)]);
     let values: Vec<f32> = values
         .into_iter()
         .map(|v| if v.is_finite() { v.max(0.) / cell } else { 0. })
@@ -60,6 +63,7 @@ fn normalize(
         height,
         values,
         display_range: [0., 1.],
+        source_elevation_range: Some(extrema.map(f64::from)),
         bottom,
         span,
         name,
@@ -112,4 +116,3 @@ pub fn parse_asc(text: &str, name: String) -> Result<HeightMap, String> {
     }
     normalize(w, h, data, cell, name)
 }
-
