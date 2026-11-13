@@ -51,7 +51,7 @@ DEMStudio 将高度场渲染与地图制作连接起来：既可以独立制作�
 
 ## 获取与运行
 
-下载 [DEMStudio 0.2.0](https://github.com/SpDDoggy/DEMStudio/releases/tag/v0.2.0)：提供 Windows x64 安装包和便携版。也可从下列完整源码构建。
+下载 [DEMStudio 0.2.0](https://github.com/SpDDoggy/DEMStudio/releases/tag/v0.2.0)：提供 Windows x64 单文件 EXE，下载后直接运行（需系统已有 WebView2 Runtime）。也可从下列完整源码构建。
 
 **环境要求**
 
