@@ -1,7 +1,21 @@
-//! Native progressive OpenGL baseline. Progressive heightfield rendering with embedded GLSL.
+//! Native progressive OpenGL baseline. Recovered GLSL stays immutable in research/.
 use super::{appearance::ColorTexture, HeightMap, OverlayRect, RenderParams};
 use glow::HasContext;
 use std::cell::{Cell, RefCell};
+pub(super) type SampleRngState = [u32; 4];
+#[derive(Clone, Debug)]
+pub(super) struct SampleUniformRecord {
+    pub pixel_jitter: [f32; 2], pub dices: Vec<f32>, pub lobes: Vec<f32>,
+    pub sun_r: [f32; 2], pub env_r: f32,
+}
+pub(super) struct AsyncSampleTable { pub values: Vec<f32>, pub stride: usize, pub after_rng: SampleRngState }
+fn sample_uniform_record(mut random: impl FnMut()->f32, geo: bool, shortest: f32, segments: usize)->SampleUniformRecord {
+    let pixel_jitter=if geo {[0.,0.]}else{[(random()-0.5)*2./shortest,(random()-0.5)*2./shortest]};
+    let dices=(0..segments*4).map(|_|random()).collect();
+    let lobes=(0..segments*2).map(|_|random()).collect();
+    let sun_r=[random(),random()];let env_r=random();
+    SampleUniformRecord{pixel_jitter,dices,lobes,sun_r,env_r}
+}
 #[path = "stretch.rs"]
 mod stretch;
 
@@ -18,7 +32,7 @@ pub use paged_gpu::PagedExport;
 
 
 
-const VERT: &str = "#version 330 compatibility\nout vec2 st; uniform vec2 aspect; uniform vec2 pixel_jitter; void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2); gl_Position=vec4(p*2.-1.,0.,1.);st=(p*2.-1.)*aspect+pixel_jitter;}";
+pub(super) const VERT: &str = "#version 330 compatibility\nout vec2 st; uniform vec2 aspect; uniform vec2 pixel_jitter; void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2); gl_Position=vec4(p*2.-1.,0.,1.);st=(p*2.-1.)*aspect+pixel_jitter;}";
 // Presentation only: the exported output texture remains untouched. All mask
 // geometry and the blur radius are in physical viewport pixels, independent of
 // the temporary interaction render resolution.
@@ -313,6 +327,14 @@ impl GlRenderer {
         self.params.appearance_mode = "material".into();
         self.reset();
         Ok(())
+    }
+
+    pub(super) fn sample_rng_checkpoint(&self) -> SampleRngState {
+        self.rng
+    }
+
+    pub(super) fn restore_sample_rng(&mut self, checkpoint: SampleRngState) {
+        self.rng = checkpoint;
     }
 
     fn random(&mut self) -> f32 {
@@ -709,29 +731,44 @@ impl GlRenderer {
 
     // During a frozen export tile only the random sequence changes per sample.
     // Keep this shared with the ordinary path so call order remains identical.
-    unsafe fn advance_sample_uniforms(&mut self, pr: glow::Program, p: &RenderParams) {
-        let (full, _) = output_tile_mapping(self.output_tile, [p.width, p.height]);
-        let shortest = full[0].min(full[1]);
-        let jitter = if self.geo_tile.is_some() { [0., 0.] } else {
-            [(self.random()-0.5)*2./shortest, (self.random()-0.5)*2./shortest]
-        };
-        self.v2(pr, "pixel_jitter", jitter);
-        let segments=if p.experimental_bounces {101} else {16};
-        let dices: Vec<f32> = (0..segments*4).map(|_| self.random()).collect();
-        let lobes: Vec<f32> = (0..segments*2).map(|_| self.random()).collect();
-        self.gl.uniform_4_f32_slice(self.gl.get_uniform_location(pr, "dices[0]").as_ref(), &dices);
-        self.gl.uniform_2_f32_slice(self.gl.get_uniform_location(pr, "lobes[0]").as_ref(), &lobes);
-        let sun_r = [self.random(), self.random()];
-        self.v2(pr, "sun_r", sun_r);
-        let env_r = self.random();
-        self.f(pr, "env_r", env_r);
+    pub(super) fn generate_sample_uniforms(&mut self,p:&RenderParams)->SampleUniformRecord {
+        let(full,_)=output_tile_mapping(self.output_tile,[p.width,p.height]);
+        let geo=self.geo_tile.is_some();
+        sample_uniform_record(||self.random(),geo,full[0].min(full[1]),if p.experimental_bounces{101}else{16})
+    }
+    unsafe fn apply_sample_uniforms(&self,pr:glow::Program,r:&SampleUniformRecord){
+        self.v2(pr,"pixel_jitter",r.pixel_jitter);
+        self.gl.uniform_4_f32_slice(self.gl.get_uniform_location(pr,"dices[0]").as_ref(),&r.dices);
+        self.gl.uniform_2_f32_slice(self.gl.get_uniform_location(pr,"lobes[0]").as_ref(),&r.lobes);
+        self.v2(pr,"sun_r",r.sun_r);self.f(pr,"env_r",r.env_r);
+    }
+    unsafe fn advance_sample_uniforms(&mut self,pr:glow::Program,p:&RenderParams){
+        let record=self.generate_sample_uniforms(p);self.apply_sample_uniforms(pr,&record);
+    }
+    /// Sample zero was already consumed by the original first-sample path.
+    pub(super) fn generate_async_sample_table(&mut self,p:&RenderParams,target:u32)->AsyncSampleTable {
+        let segments=if p.experimental_bounces{101}else{16};let stride=segments*6+8;
+        let mut values=vec![0.;target as usize*stride];
+        for sample in 1..target as usize {
+            let r=self.generate_sample_uniforms(p);let dst=&mut values[sample*stride..(sample+1)*stride];
+            dst[..2].copy_from_slice(&r.pixel_jitter);dst[2..2+segments*4].copy_from_slice(&r.dices);
+            dst[2+segments*4..2+segments*6].copy_from_slice(&r.lobes);
+            dst[2+segments*6..4+segments*6].copy_from_slice(&r.sun_r);
+            dst[4+segments*6]=r.env_r;dst[5+segments*6]=1./(sample+1) as f32;
+        }
+        AsyncSampleTable{values,stride,after_rng:self.sample_rng_checkpoint()}
     }
 
     unsafe fn prepare_sample(&mut self) -> Result<(), String> {
+        self.prepare_sample_program(self.path,true)
+    }
+
+    // Query workers share the exact scene transform binder, but never consume
+    // the path RNG. Their terrain uniforms can be optimized out of integration.
+    unsafe fn prepare_sample_program(&mut self,pr:glow::Program,advance_random:bool) -> Result<(), String> {
         let p = self.params.clone();
         let map = self.map.as_ref().unwrap();
         let (map_width, map_height, map_span) = (map.width, map.height, map.span);
-        let pr = self.path;
         self.gl.use_program(Some(pr));
         self.i(pr, "surface_pass", 0);
         self.i(pr, "appearance_color_blend", i32::from(elevation_color_blend(&p)));
@@ -756,7 +793,7 @@ impl GlRenderer {
         self.i(pr, "output_tiled", i32::from(self.output_tile.is_some()));
         let shortest = full[0].min(full[1]);
         self.v2(pr, "aspect", [full[0] / shortest, full[1] / shortest]);
-        self.advance_sample_uniforms(pr, &p);
+        if advance_random {self.advance_sample_uniforms(pr, &p);}
         self.v2(pr, "tex_rand_inv_size", [1. / 256., 1. / 256.]);
         self.v4(pr, "jitter_mult", [0.7548777, 0.5698403, 0.4382891, 0.328173]);
         let logical_width = map_width + if self.geo_tile.is_some() { 2 } else { 0 };
@@ -1446,16 +1483,34 @@ impl Drop for GlRenderer {
     }
 }
 
+pub(super) fn diagnostic_trace(stage: &str) {
+    if std::env::var_os("DEMSTUDIO_DIAGNOSTIC_MODE").is_none() {return;}
+    use std::io::Write;
+    let path=std::env::temp_dir().join(format!("DEMStudio-crash-stage-{}.log",std::process::id()));
+    if let Ok(mut file)=std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let stamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+        let _=writeln!(file,"{stamp} {stage}");
+        let _=file.sync_all();
+    }
+}
+
 unsafe fn program(gl: &glow::Context, fragment: &str) -> Result<glow::Program, String> {
+    program_with_vertex(gl, VERT, fragment)
+}
+unsafe fn program_with_vertex(gl: &glow::Context, vertex: &str, fragment: &str) -> Result<glow::Program, String> {
+    let identity=format!("bytes={} resident={} bicubic={}",fragment.len(),fragment.contains("rs_texture_mipmap"),fragment.contains("#define PRIM_BICUBIC"));
+    diagnostic_trace(&format!("program_begin {identity}"));
     let p = gl.create_program()?;
     let mut shaders = Vec::new();
     for (kind, source) in [
-        (glow::VERTEX_SHADER, VERT),
+        (glow::VERTEX_SHADER, vertex),
         (glow::FRAGMENT_SHADER, fragment),
     ] {
         let s = gl.create_shader(kind)?;
         gl.shader_source(s, source);
+        diagnostic_trace(&format!("compile_begin kind={kind} {identity}"));
         gl.compile_shader(s);
+        diagnostic_trace(&format!("compile_submitted kind={kind} {identity}"));
         if !gl.get_shader_compile_status(s) {
             let log = gl.get_shader_info_log(s);
             gl.delete_shader(s);
@@ -1465,11 +1520,16 @@ unsafe fn program(gl: &glow::Context, fragment: &str) -> Result<glow::Program, S
             gl.delete_program(p);
             return Err(format!("GLSL 编译失败: {log}"));
         }
+        diagnostic_trace(&format!("compile_ok kind={kind} {identity}"));
         gl.attach_shader(p, s);
         shaders.push(s);
     }
+    diagnostic_trace(&format!("link_begin {identity}"));
+    
     gl.link_program(p);
+    diagnostic_trace(&format!("link_submitted {identity}"));
     let ok = gl.get_program_link_status(p);
+    diagnostic_trace(&format!("link_status={ok} {identity}"));
     let log = gl.get_program_info_log(p);
     for s in shaders {
         gl.detach_shader(p, s);
@@ -1481,11 +1541,22 @@ unsafe fn program(gl: &glow::Context, fragment: &str) -> Result<glow::Program, S
     }
     Ok(p)
 }
+unsafe fn compute_program(gl: &glow::Context, source: &str) -> Result<glow::Program,String> {
+    diagnostic_trace("raystate_compute_compile_begin");
+    let shader=gl.create_shader(glow::COMPUTE_SHADER)?;
+    gl.shader_source(shader,source); gl.compile_shader(shader);
+    if !gl.get_shader_compile_status(shader) {let log=gl.get_shader_info_log(shader);gl.delete_shader(shader);return Err(format!("计算着色器编译失败: {log}"));}
+    let program=match gl.create_program(){Ok(p)=>p,Err(e)=>{gl.delete_shader(shader);return Err(e)}};
+    gl.attach_shader(program,shader);gl.link_program(program);gl.detach_shader(program,shader);gl.delete_shader(shader);
+    if !gl.get_program_link_status(program){let log=gl.get_program_info_log(program);gl.delete_program(program);return Err(format!("计算着色器链接失败: {log}"));}
+    diagnostic_trace("raystate_compute_link_ok");Ok(program)
+}
+
 // Higher mip levels bound every source mip cell touched by a shifted logical
 // cell. The logical interval [k*S,(k+1)*S] maps to [k*S-1,(k+1)*S-1],
 // intersecting at most two source cells per axis. Existing stride-2 3x3 maxima
 // conservatively include each cell's bilinear endpoint samples.
-const GEO_HEIGHT_SAMPLER: &str = r#"
+pub(super) const GEO_HEIGHT_SAMPLER: &str = r#"
 uniform sampler2D mipmap;
 uniform vec2 geo_source_size;
 uniform vec2 mipmap_tex_inv_size;
@@ -1579,6 +1650,18 @@ pub(super) fn path_source(p: &RenderParams, geo: bool) -> String {
     let mut source = String::from(
         "#version 330 compatibility\n#define OPT_SUN\n#define OPT_SUN_DISK\n",
     );
+    if p.surface=="bicubic"&&std::env::var("DEMSTUDIO_BICUBIC_ROOT_REBUILD").as_deref()==Ok("on"){
+        source.push_str("#define BC_ROOT_REBUILD_KEYS\n");
+    }
+    if p.surface=="bicubic"&&std::env::var("DEMSTUDIO_BICUBIC_ROOT_STACKLESS").as_deref()==Ok("on"){
+        source.push_str("#define BC_ROOT_STACKLESS_KEYS\n");
+    }
+    if p.surface=="bicubic"&&std::env::var("DEMSTUDIO_BICUBIC_ROOT_RIGHT_CACHE").as_deref()==Ok("on"){
+        source.push_str("#define BC_ROOT_RIGHT_CACHE\n");
+    }
+    if p.surface=="bicubic"&&std::env::var("DEMSTUDIO_BICUBIC_ROOT_KEYS").as_deref()==Ok("on"){
+        source.push_str("#extension GL_ARB_gpu_shader5 : require\n#define BC_ROOT_DYADIC_KEYS\n");
+    }
     source.push_str("uniform int surface_pass;\nuniform float height_curve;\nfloat source_height(float t){if(height_curve==1.)return t;float q=clamp((t-1e-6)/(1.-1e-6),0.,1.);return (height_curve*q/((1.-q)+height_curve*q))*(1.-1e-6)+1e-6;}\n");
     source.push_str("uniform vec2 output_full_size,output_tile_origin;uniform int output_tiled;uniform vec2 pixel_jitter;\nvec2 output_pixel(){return gl_FragCoord.xy+(output_tiled!=0?output_tile_origin:vec2(0.));}\nvec2 output_st(vec2 original){if(output_tiled==0)return original;return (output_pixel()*2.-output_full_size)/min(output_full_size.x,output_full_size.y)+pixel_jitter;}\n");
     source.push_str(match p.surface.as_str() {
@@ -1674,11 +1757,39 @@ pub(super) fn path_source(p: &RenderParams, geo: bool) -> String {
             block
         };
         let block = if p.surface == "bicubic" && block.contains("float heightLod(") {
-            block.replace("return h+mipmap_size.w;}", &format!("return h+mipmap_size.w;}}\n{}\n#define heightLod bc_bound\n", include_str!("bicubic.glsl")))
+            let root_v2 = if cfg!(test) && std::env::var("DEMSTUDIO_BICUBIC_ROOT_V2").as_deref()==Ok("on") {
+                if std::env::var("DEMSTUDIO_BICUBIC_ROOT_ENDPOINT_CERT").as_deref()==Ok("on") {
+                    "#define BC_ROOT_V2\n#define BC_ROOT_V2_ENDPOINT_CERT\n"
+                } else { "#define BC_ROOT_V2\n" }
+            } else { "" };
+            let root_v2 = if cfg!(test) && !root_v2.is_empty() && std::env::var("DEMSTUDIO_BICUBIC_ROOT_INPLACE_LEFT").as_deref()==Ok("on") {
+                format!("{root_v2}#define BC_ROOT_V2_INPLACE_LEFT\n")
+            } else { root_v2.to_owned() };
+            let root_v2 = if cfg!(test) && std::env::var("DEMSTUDIO_BICUBIC_PATCH_REJECT").as_deref()==Ok("on") {
+                format!("{root_v2}#define BC_PATCH_REJECT\n")
+            } else {root_v2};
+            let root_precheck = if std::env::var("DEMSTUDIO_BICUBIC_ROOT_PRECHECK").as_deref() == Ok("on") {
+                "#define BC_ROOT_NEGATIVE_PRECHECK\n"
+            } else { "" };
+            let root_stack = if std::env::var("DEMSTUDIO_BICUBIC_STACK").as_deref() == Ok("left") {
+                "#define BC_ROOT_STACK_LEFT_CONTINUE\n"
+            } else { "" };
+            let shadow_any_root=if std::env::var("DEMSTUDIO_BICUBIC_SHADOW_ANY_ROOT").as_deref()==Ok("on"){
+                "#define BC_ANY_ROOT_EARLY\n"
+            }else{""};
+            let bicubic_source=if std::env::var("DEMSTUDIO_BICUBIC_STATIC_ROOT").as_deref()==Ok("on")
+                || std::env::var("DEMSTUDIO_BICUBIC_LEAF_BOUNDS").as_deref()==Ok("on") {
+                crate::renderer::bicubic_static::expand(include_str!("bicubic.glsl"))
+            }else{include_str!("bicubic.glsl").to_owned()};
+            block.replace("return h+mipmap_size.w;}", &format!("return h+mipmap_size.w;}}\n{root_v2}{root_precheck}{root_stack}{shadow_any_root}{bicubic_source}\n#define heightLod bc_bound\n"))
                 .replace("vec4 H=vec4(heightLod(i_pos,lod),heightLod(i_pos+vec2(scale,0.0),lod),heightLod(i_pos+vec2(0.0,scale),lod),heightLod(i_pos+vec2(scale,scale),lod));", "vec4 H=vec4(bc_bound(i_cell,lod));")
         } else {
             block
         };
+        let block = if p.surface=="bilinear"&&std::env::var("DEMSTUDIO_BILINEAR_STABLE_ROOT").as_deref()==Ok("on") {
+            block.replace("float mid=(e.x+e.y)*0.5;float sm=sign(bi_delta(o+dir*mid,h,i_pos,inv));e=mix(vec2(e.x,mid),vec2(mid,e.y),step(0.0,sm));",
+                "vec2 previous_e=e;float mid=(e.x+e.y)*0.5;float sm=sign(bi_delta(o+dir*mid,h,i_pos,inv));e=mix(vec2(e.x,mid),vec2(mid,e.y),step(0.0,sm));if(all(equal(floatBitsToUint(e),floatBitsToUint(previous_e))))break;")
+        }else{block};
         let block = if block.contains("vec4 grid_line(") {
             let start = block.find("vec4 grid_line(").unwrap();
             let end = block[start..].find("\n#endif").unwrap() + start;
@@ -1920,7 +2031,7 @@ const GROUND_GRID: &str = "vec4 grid_line(vec2 id,vec3 v,vec3 n){if(!is_ground(i
 fn height_offset(width: u32, height: u32, p: &RenderParams) -> f32 {
     p.height_offset * width.max(height) as f32 * 0.01
 }
-fn display_sample(value: f32, [minimum, maximum]: [f32; 2]) -> f32 {
+pub(super) fn display_sample(value: f32, [minimum, maximum]: [f32; 2]) -> f32 {
     if value == 0. {
         return 0.;
     }
@@ -1977,3 +2088,11 @@ fn camera_basis(yaw: f32, pitch: f32) -> [f32; 9] {
 fn bytes(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
+
+
+
+
+
+
+
+

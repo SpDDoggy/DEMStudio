@@ -96,7 +96,8 @@ where
     encoder.set_source_gamma(png::ScaledFloat::from_scaled(45455));
     match compression {
         
-                // Adaptive row filtering is retained. Deflate level 1 preserves all
+        
+        // Adaptive row filtering is retained. Deflate level 1 preserves all
         // RGBA bytes while avoiding the slower default level-6 search.
         Encoding::LevelOne => encoder.set_deflate_compression(png::DeflateCompression::Level(1)),
     }
@@ -134,3 +135,5 @@ where
     fs::rename(&pending.0, path).map_err(|e| format!("完成 PNG 文件失败：{e}"))?;
     Ok(())
 }
+
+

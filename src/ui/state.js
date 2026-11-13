@@ -96,6 +96,7 @@ export const fields = {
   samples: { label: '采样', value: 256, min: 1, max: 65536, step: 1, range: false },
   projection: { value: 'perspective', options: { perspective: '透视', orthographic: '正交', isometric: '等轴' } },
   grid: { value: true, type: 'boolean' },
+  exportGeoreference: { label: '导出地理信息', value: false, type: 'boolean' },
   exportShadow: { label: '范围', value: false, type: 'boolean' },
   shadowPadding: { label: '外扩 (%)', value: 20, min: 1, max: 200, step: 1, range: false },
 };

@@ -1,8 +1,9 @@
 //! Pixel-corner georeferencing; no reprojection is performed here.
 use std::{
     fs,
-    io::{Read, Seek},
+    io::{Read, Seek, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 use tiff::{decoder::Decoder, tags::Tag};
 
@@ -16,6 +17,44 @@ pub struct GeoReference {
     pub wkt: Option<String>,
 }
 impl GeoReference {
+    /// A source CRS definition, independent of its affine pixel grid. Free-form
+    /// GeoAscii citations are not coordinate-system definitions.
+    pub fn has_crs(&self) -> bool {
+        self.has_embedded_crs() || self.wkt.as_deref().is_some_and(valid_wkt)
+    }
+    pub(super) fn has_embedded_crs(&self) -> bool {
+        valid_geokeys(self) && [3072, 2048].into_iter()
+            .any(|id| inline_key(&self.keys, id).is_some_and(|v| v != 0 && v != 32767))
+    }
+    fn pam_srs(&self) -> Option<String> {
+        if let Some(wkt) = self.wkt.as_deref().filter(|w| valid_wkt(w)) {
+            return Some(wkt.trim().to_owned());
+        }
+        if self.has_embedded_crs() {
+            return [3072, 2048].into_iter().find_map(|id|
+                inline_key(&self.keys, id).filter(|v| *v != 0 && *v != 32767)
+                    .map(|code| format!("EPSG:{code}")));
+        }
+        None
+    }
+    /// Scale the complete source footprint onto the unpadded output grid, then
+    /// shift its origin by output-pixel margins. Grid dimensions exclude margins.
+    pub fn resized_grid(
+        &self, source_width: u32, source_height: u32,
+        grid_width: u32, grid_height: u32, left: u32, top: u32,
+    ) -> Result<Self, String> {
+        if [source_width, source_height, grid_width, grid_height].contains(&0) || !self.valid() {
+            return Err("地理输出网格无效".into());
+        }
+        let mut geo = self.clone();
+        let sx = f64::from(source_width) / f64::from(grid_width);
+        let sy = f64::from(source_height) / f64::from(grid_height);
+        geo.transform[1] *= sx;
+        geo.transform[4] *= sx;
+        geo.transform[2] *= sy;
+        geo.transform[5] *= sy;
+        geo.shifted_pixels(-i64::from(left), -i64::from(top))
+    }
     pub fn crs_label(&self) -> String {
         for id in [3072, 2048] {
             if let Some(code) = inline_key(&self.keys, id).filter(|c| *c != 32767 && *c != 0) {
@@ -96,10 +135,198 @@ impl GeoReference {
         }
     }
     pub fn valid(&self) -> bool {
+        let determinant = self.transform[1] * self.transform[5] - self.transform[2] * self.transform[4];
         self.transform.iter().all(|v| v.is_finite())
-            && (self.transform[1] * self.transform[5] - self.transform[2] * self.transform[4]).abs()
-                > 0.
+            && determinant.is_finite() && determinant != 0.
     }
+}
+
+fn valid_geokeys(geo: &GeoReference) -> bool {
+    let keys = &geo.keys;
+    if keys.len() < 4 || keys[0] != 1 { return false; }
+    let end = 4 + usize::from(keys[3]) * 4;
+    let Some(entries) = keys.get(4..end) else { return false; };
+    entries.chunks_exact(4).all(|key| {
+        let count = usize::from(key[2]);
+        let offset = usize::from(key[3]);
+        count > 0 && match key[1] {
+            0 => count == 1,
+            34735 => offset >= end && offset + count <= keys.len(),
+            34736 => offset + count <= geo.doubles.len()
+                && geo.doubles[offset..offset + count].iter().all(|v| v.is_finite()),
+            34737 => offset + count <= geo.ascii.len() + 1,
+            _ => false,
+        }
+    })
+}
+
+// Retain source WKT without a projection-library dependency. Check its root and
+// balanced syntax; this does not resolve CRS authorities or reproject anything.
+fn valid_wkt(value: &str) -> bool {
+    let value = value.trim();
+    let Some(open) = value.find('[') else { return false; };
+    let root = value[..open].trim().to_ascii_uppercase();
+    if !matches!(root.as_str(),
+        "PROJCS" | "GEOGCS" | "GEOCCS" | "LOCAL_CS" | "COMPD_CS" | "VERT_CS"
+        | "PROJCRS" | "GEOGCRS" | "GEODCRS" | "VERTCRS" | "ENGCRS"
+        | "COMPOUNDCRS" | "BOUNDCRS" | "DERIVEDPROJCRS") { return false; }
+    let body = value[open + 1..].trim_start();
+    if root == "BOUNDCRS" {
+        let Some(source_open) = body.find('[') else { return false; };
+        if !body[..source_open].trim().eq_ignore_ascii_case("SOURCECRS") { return false; }
+    } else if !body.starts_with('"') { return false; }
+    let mut depth = 0i32;
+    let mut quoted = false;
+    let mut chars = value[open..].chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_control() && !c.is_whitespace() { return false; }
+        if c == '"' {
+            if quoted && chars.peek() == Some(&'"') { chars.next(); }
+            else { quoted = !quoted; }
+        } else if !quoted {
+            match c {
+                '[' => depth += 1,
+                ']' => { depth -= 1; if depth == 0 { return chars.all(char::is_whitespace); } },
+                _ => {}
+            }
+            if depth < 0 { return false; }
+        }
+    }
+    false
+}
+
+// GDAL's PAM loader expects the dataset node first; a leading XML comment can
+// make it ignore the entire file. Keep ownership inside that root element.
+const PAM_MARKER: &str = "<PAMDataset>\n<!-- DEMStudio georeference v1 -->\n";
+static NEXT_AUX: AtomicU64 = AtomicU64::new(0);
+
+fn aux_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".aux.xml");
+    PathBuf::from(name)
+}
+
+/// Call before replacing the output image. Unowned location files must never be
+/// deleted or silently inherited by an output whose geography was disabled.
+pub fn validate_output_sidecars(path: &Path, writing_geo: bool) -> Result<(), String> {
+    let ext = path.extension().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
+    let short = match ext.as_str() { "png" => "pgw", "tif" | "tiff" => "tfw", _ => "wld" };
+    if !writing_geo {
+        if let Some(world) = sidecar(path, &[short.into(), format!("{ext}w"), "wld".into()]) {
+            return Err(format!("输出路径已有地理辅助文件，请更换文件名：{}", world.display()));
+        }
+    }
+    let aux = aux_path(path);
+    match fs::read_to_string(&aux) {
+        Ok(value) if value.starts_with(PAM_MARKER) => Ok(()),
+        Ok(_) => Err(format!("输出路径已有外部地理辅助文件，请更换文件名：{}", aux.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("无法检查地理辅助文件：{e}")),
+    }
+}
+
+/// Remove only the PAM metadata created by this application, after geo-off
+/// image output succeeds. Unknown sidecars are reported, never removed.
+pub fn clear_output_aux(path: &Path) -> Result<(), String> {
+    validate_output_sidecars(path, false)?;
+    match fs::remove_file(aux_path(path)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("无法清理原输出地理辅助文件：{e}")),
+    }
+}
+
+fn xml_text(value: &str) -> String {
+    value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        .replace('"', "&quot;").replace('\'', "&apos;")
+}
+
+fn xml_unescape(value: &str) -> Result<String, String> {
+    let mut result = String::new();
+    let mut rest = value;
+    while let Some(index) = rest.find('&') {
+        result.push_str(&rest[..index]);
+        rest = &rest[index..];
+        let Some(end) = rest.find(';') else { return Err("地理辅助文件 XML 转义无效".into()); };
+        result.push(match &rest[..=end] {
+            "&amp;" => '&', "&lt;" => '<', "&gt;" => '>', "&quot;" => '"', "&apos;" => '\'',
+            _ => return Err("地理辅助文件 XML 转义无效".into()),
+        });
+        rest = &rest[end + 1..];
+    }
+    result.push_str(rest);
+    Ok(result)
+}
+fn pam_field<'a>(xml: &'a str, open: &str, close: &str) -> Result<&'a str, String> {
+    let (_, tail) = xml.split_once(open).ok_or("地理辅助文件缺少字段")?;
+    let (field, after) = tail.split_once(close).ok_or("地理辅助文件字段无效")?;
+    if field.contains('<') || after.contains(open) { return Err("地理辅助文件字段无效".into()); }
+    Ok(field)
+}
+
+/// Read only this application's PAM shape. External PAM belongs to its writer;
+/// ordinary world/PRJ sidecars continue through the existing import path.
+pub fn read_aux(path: &Path) -> Result<Option<GeoReference>, String> {
+    let xml = match fs::read_to_string(aux_path(path)) {
+        Ok(xml) => xml,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("读取地理辅助文件失败：{e}")),
+    };
+    if !xml.starts_with(PAM_MARKER) { return Ok(None); }
+    let srs = xml_unescape(pam_field(&xml, "<SRS>", "</SRS>")?)?;
+    let transform = pam_field(&xml, "<GeoTransform>", "</GeoTransform>")?.split(',')
+        .map(|v| v.trim().parse::<f64>().map_err(|_| "地理辅助文件仿射变换无效".to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let transform: [f64; 6] = transform.try_into().map_err(|_| "地理辅助文件应包含六项仿射变换")?;
+    let (keys, wkt) = if let Some(code) = srs.strip_prefix("EPSG:") {
+        let code = code.parse::<u16>().ok().filter(|v| *v != 0 && *v != 32767)
+            .ok_or("地理辅助文件 EPSG 无效")?;
+        let kind = pam_field(&xml, "<MDI key=\"CrsGeoKey\">", "</MDI>")?
+            .parse::<u16>().map_err(|_| "地理辅助文件坐标系类型无效")?;
+        if ![2048, 3072].contains(&kind) { return Err("地理辅助文件坐标系类型无效".into()); }
+        (vec![1,1,0,3,1024,0,1,if kind == 3072 {1} else {2},1025,0,1,1,kind,0,1,code], None)
+    } else if valid_wkt(&srs) {
+        (keys_from_wkt(&srs), Some(srs))
+    } else { return Err("地理辅助文件坐标系无效".into()); };
+    let geo = GeoReference { transform, keys, doubles: vec![], ascii: String::new(), wkt };
+    if !geo.valid() || !geo.has_crs() { return Err("地理辅助文件地理定位无效".into()); }
+    Ok(Some(geo))
+}
+
+struct PendingAux(PathBuf);
+impl Drop for PendingAux { fn drop(&mut self) { let _ = fs::remove_file(&self.0); } }
+
+/// Standard GDAL PAM for PNG or TIFF; the full image suffix is retained.
+/// EPSG identifiers are SRS user input here, never mislabelled as PRJ WKT.
+pub fn write_png_aux(path: &Path, geo: &GeoReference) -> Result<PathBuf, String> {
+    validate_output_sidecars(path, true)?;
+    if !geo.valid() { return Err("地理仿射变换无效".into()); }
+    let srs = geo.pam_srs().ok_or("源图像未定义可写出的地理坐标系")?;
+    let transform = geo.transform.iter().map(|v| format!("{v:.17e}")).collect::<Vec<_>>().join(", ");
+    let kind = if srs.starts_with("EPSG:") {
+        let key = if inline_key(&geo.keys, 3072).is_some_and(|v| v != 0 && v != 32767) {3072} else {2048};
+        format!("  <Metadata domain=\"DEMStudio\"><MDI key=\"CrsGeoKey\">{key}</MDI></Metadata>\n")
+    } else { String::new() };
+    let xml = format!("{PAM_MARKER}  <SRS>{}</SRS>\n  <GeoTransform>{transform}</GeoTransform>\n{kind}</PAMDataset>\n", xml_text(&srs));
+    let aux = aux_path(path);
+    let parent = aux.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = aux.file_name().ok_or("地理辅助文件名无效")?.to_string_lossy();
+    for _ in 0..32 {
+        let temporary = parent.join(format!(".{name}.{}.{}.part", std::process::id(), NEXT_AUX.fetch_add(1, Ordering::Relaxed)));
+        match fs::OpenOptions::new().write(true).create_new(true).open(&temporary) {
+            Ok(mut file) => {
+                let pending = PendingAux(temporary);
+                file.write_all(xml.as_bytes()).map_err(|e| format!("写入地理辅助文件失败：{e}"))?;
+                file.sync_all().map_err(|e| format!("保存地理辅助文件失败：{e}"))?;
+                drop(file);
+                fs::rename(&pending.0, &aux).map_err(|e| format!("完成地理辅助文件失败：{e}"))?;
+                return Ok(aux);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {},
+            Err(e) => return Err(format!("无法创建地理辅助文件：{e}")),
+        }
+    }
+    Err("无法分配地理辅助文件".into())
 }
 fn inline_key(keys: &[u16], id: u16) -> Option<u16> {
     let count = usize::from(*keys.get(3)?);
@@ -150,6 +377,18 @@ pub fn read_tiff<R: Read + Seek>(decoder: &mut Decoder<R>) -> Result<Option<GeoR
     }
     Ok(Some(geo))
 }
+
+/// Embedded CRS remains authoritative. Area/affine-only TIFF output can use
+/// this application's complete PAM grid and WKT, including resized exports.
+pub fn read_tiff_with_sidecars<R: Read + Seek>(
+    decoder: &mut Decoder<R>, path: &Path,
+) -> Result<Option<GeoReference>, String> {
+    match read_tiff(decoder)? {
+        Some(geo) if geo.has_crs() => Ok(Some(geo)),
+        Some(geo) => Ok(read_aux(path)?.or(Some(geo))),
+        None => read_sidecars(path),
+    }
+}
 fn sidecar(path: &Path, extensions: &[String]) -> Option<PathBuf> {
     for ext in extensions {
         let candidate = path.with_extension(ext);
@@ -174,6 +413,7 @@ fn sidecar(path: &Path, extensions: &[String]) -> Option<PathBuf> {
         })
 }
 pub fn read_sidecars(path: &Path) -> Result<Option<GeoReference>, String> {
+    if let Some(geo) = read_aux(path)? { return Ok(Some(geo)); }
     let ext = path
         .extension()
         .unwrap_or_default()

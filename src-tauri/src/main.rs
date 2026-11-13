@@ -13,6 +13,7 @@ struct Runtime(Mutex<Option<RendererHandle>>);
 #[derive(Default)]
 struct ExportResultPath(Mutex<Option<PathBuf>>);
 
+
 fn handle(state: &Runtime) -> Result<RendererHandle, String> {
     state
         .0
@@ -376,14 +377,10 @@ async fn renderer_export_geotiff(
         validate_output(p)?;
     }
     let h = handle(&state)?;
-    let source = h.status().source.ok_or("请先导入带地理坐标的图像")?;
-    let geo = source.geo.as_ref().ok_or("输入图像没有地理坐标")?;
-    if geo.keys.is_empty() {
-        return Err("输入坐标系缺少可写入 GeoTIFF 的定义".into());
-    }
+    let source = h.status().source;
     let Some(file) = rfd::AsyncFileDialog::new()
-        .add_filter("GeoTIFF", &["tif", "tiff"])
-        .set_file_name("terrain-ortho.tif")
+        .add_filter("TIFF", &["tif", "tiff"])
+        .set_file_name("terrain.tif")
         .save_file()
         .await
     else {
@@ -399,7 +396,7 @@ async fn renderer_export_geotiff(
     // The imported source remains the persistent data source for later exports.
     if std::fs::canonicalize(&path)
         .ok()
-        .is_some_and(|p| std::fs::canonicalize(&source.path).ok().as_ref() == Some(&p))
+        .is_some_and(|p| source.as_ref().and_then(|source| std::fs::canonicalize(&source.path).ok()).as_ref() == Some(&p))
     {
         return Err("输出文件不能覆盖当前输入图像".into());
     }
@@ -416,6 +413,12 @@ fn renderer_cancel_export(state: tauri::State<Runtime>) -> Result<(), String> {
     handle(&state)?.cancel_export();
     Ok(())
 }
+
+
+
+
+
+
 #[tauri::command]
 fn ui_ready(control_count: usize) -> bool { let _ = control_count; true }
 fn main() {

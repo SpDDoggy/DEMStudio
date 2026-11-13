@@ -1,7 +1,7 @@
 import { fields, createSceneState, normalizeParameter, sceneGradeKeys, resetSceneGrading, rampLibrary, rampPalette, nativeRamp } from './state.js';
 import { projectViewCube, cameraPresets, applyCameraPreset } from './camera-axis.js';
 import { cameraPanDelta, nativePanPixels, resetCameraParameters } from './camera-navigation.js';
-import { stretchKeys, exportKeys, createExportSettings, exportSnapshot, previewScale, sourceOutputSize, freezeCurrentView, viewOutputSize, proportionalSize, cloneScene } from './export-settings.js';
+import { stretchKeys, exportKeys, createExportSettings, exportRequest, previewScale, sourceOutputSize, freezeCurrentView, viewOutputSize, sourceHasCrs, cloneScene } from './export-settings.js';
 import { enhanceSelects } from './combobox.js';
 import { createExportProgress } from './export-progress.js';
 import { createPresetStore, defaultPresetSettings, applyPresetSettings } from './render-presets.js';
@@ -164,7 +164,7 @@ function applyStatus(status) {
   document.querySelector('#remove-texture').disabled = !status.ready || !status.textureName || !!status.exporting || removingTexture;
   document.querySelector('[data-appearance=texture]').disabled = !status.textureName || !!status.exporting;
   document.querySelector('#export-image').disabled = !status.ready || status.exporting;
-  document.querySelector('#export-geotiff').disabled = !status.ready || status.exporting || !status.source?.geo?.keys?.length;
+  document.querySelector('#export-geotiff').disabled = !status.ready || !!status.exporting;
   document.querySelector('#cancel-export').hidden = !status.exporting;
   document.querySelectorAll('[data-key],[role=tab],[data-mode],button[data-view],[data-appearance=material],[data-appearance=elevation],#reset-camera,#reset-grading,#toggle-grid,#render-preset,#preset-name,#save-preset,#apply-preset,#remove-preset,#reset-render').forEach(control => { control.disabled = !!status.exporting; });
   const source = status.source;
@@ -202,13 +202,17 @@ function queueParameterUpdate() {
 async function nativeFileCommand(command) {
   if (!rendererReady || nativeDialogOpen || removingTexture) return;
   nativeDialogOpen = true;
+  const exporting = command === 'renderer_export' || command === 'renderer_export_geotiff';
   try {
+    const request = exporting ? exportRequest(exportSceneSnapshot ?? rendererParams(), exportSettings) : null;
+    exportCommandPending = exporting;
+    if (exporting) {
+      previewRevision++; clearTimeout(previewTimer);
+      resetExportResult();
+    }
     await flushParameterUpdate();
     if (command === 'renderer_import') await sourceSettings.suspend();
-    const exporting = command === 'renderer_export' || command === 'renderer_export_geotiff';
-    exportCommandPending = exporting;
-    if (exporting && typeof resetExportResult === 'function') resetExportResult();
-    const result = await invoke(command, exporting ? { params: {...exportSnapshot(exportSceneSnapshot ?? rendererParams(), exportSettings), exportShadow: command === 'renderer_export_geotiff' && exportSettings.exportShadow} } : undefined);
+    const result = await invoke(command, exporting ? { params: request.params } : undefined);
     if (exporting && result) await showExportResult();
     if ((command === 'renderer_import' || command === 'renderer_import_texture') && result) applyStatus(result);
     if (command === 'renderer_import' && Number.isFinite(result?.initialHeightScale)) {
@@ -227,6 +231,7 @@ async function nativeFileCommand(command) {
     if (command === 'renderer_import') sourceSettings.resume();
     exportCommandPending = false;
     updateExportProgress(null);
+    if (exporting && document.querySelector('#export-dialog').open && !exportedPreview) scheduleExportPreview();
   }
 }
 
@@ -305,7 +310,7 @@ exportButton.addEventListener('click', () => void nativeFileCommand('renderer_ex
 document.querySelector('#export-actions').append(exportButton);
 const geoExportButton = document.createElement('button');
 geoExportButton.id = 'export-geotiff'; geoExportButton.className = 'primary export-action';
-geoExportButton.textContent = '导出正射 TIF'; geoExportButton.disabled = true;
+geoExportButton.textContent = '导出 TIFF'; geoExportButton.disabled = true;
 geoExportButton.addEventListener('click', () => void nativeFileCommand('renderer_export_geotiff'));
 const cancelExportButton = document.createElement('button');
 cancelExportButton.id = 'cancel-export'; cancelExportButton.className = 'export-action';
@@ -315,13 +320,7 @@ document.querySelector('#export-actions').append(geoExportButton, cancelExportBu
 // Export preview reads the real progressive GPU frame only on demand.
 let exportSourceKey = null;
 function updateExportDimensions() {
-  let size = exportSettings;
-  if (document.querySelector('#export-format').value === 'geotiff') {
-    const source = sourceOutputSize(exportSourceStatus ?? renderStatus);
-    if (!source) return;
-    const margin = exportSettings.exportShadow ? Math.ceil(Math.max(source.width,source.height)*exportSettings.shadowPadding/100) : 0;
-    size = {width:source.width+2*margin,height:source.height+2*margin};
-  }
+  const size = exportSettings;
   for (const key of ['width','height']) {
     document.querySelector('#output').querySelectorAll(`[data-key=${key}]`).forEach(input => {input.value=size[key];});
   }
@@ -386,17 +385,18 @@ function updateExportPreviewStatus(status) {
   document.querySelector('#export-format').disabled = !!status.exporting;
   document.querySelector('#export-depth').disabled = !!status.exporting;
   document.querySelector('#export-terrain-scale').disabled = !!status.exporting;
-  document.querySelector('#export-framing').disabled = !!status.exporting || document.querySelector('#export-format').value === 'geotiff';
-  document.querySelector('#export-scale').disabled = !!status.exporting || document.querySelector('#export-format').value === 'geotiff';
-  const orthographic = document.querySelector('#export-format').value === 'geotiff';
+  document.querySelector('#export-framing').disabled = !!status.exporting;
+  document.querySelector('#export-scale').disabled = !!status.exporting;
   document.querySelector('#export-extent').disabled = !!status.exporting;
   document.querySelector('#shadow-options').querySelectorAll('input').forEach(input => { input.disabled = !!status.exporting; });
-  document.querySelector('#output').querySelectorAll('[data-key=width],[data-key=height]').forEach(input => { input.disabled = orthographic || !!status.exporting; });
+  document.querySelector('#output').querySelectorAll('[data-key=width],[data-key=height]').forEach(input => { input.disabled = !!status.exporting; });
+  syncExportGeoreference();
   updateExportDimensions();
 }
 async function refreshExportPreview() {
   const dialog = document.querySelector('#export-dialog');
-  if (!dialog.open || !rendererReady || renderStatus?.exporting || previewBusy) return;
+  if (!dialog.open || !rendererReady || renderStatus?.exporting || exportCommandPending || previewBusy) return;
+  const request = exportRequest(exportSceneSnapshot ?? rendererParams(), exportSettings);
   resetExportResult();
   previewBusy = true;
   const revision = previewRevision;
@@ -404,8 +404,8 @@ async function refreshExportPreview() {
   document.querySelector('#preview-progress').textContent = '渲染中';
   try {
     await flushParameterUpdate();
-    const orthographic = exportSettings.exportOrthographic;
-    const bytes = await invoke('renderer_preview', {orthographic, params: {...exportSnapshot(exportSceneSnapshot ?? rendererParams(), exportSettings), exportShadow: document.querySelector('#export-format').value === 'geotiff' && exportSettings.exportShadow}});
+    if (!dialog.open || revision !== previewRevision || exportCommandPending) return;
+    const bytes = await invoke('renderer_preview', request);
     if (!dialog.open || revision !== previewRevision) return;
     const next = URL.createObjectURL(new Blob([new Uint8Array(bytes)], {type:'image/png'}));
     document.querySelector('#export-preview-image').src = next;
@@ -417,7 +417,7 @@ async function refreshExportPreview() {
   finally {
     previewBusy = false;
     document.querySelector('#refresh-preview').disabled = !rendererReady || !!renderStatus?.exporting;
-    if (dialog.open && revision !== previewRevision && !exportedPreview) scheduleExportPreview();
+    if (dialog.open && revision !== previewRevision && !exportedPreview && !exportCommandPending) scheduleExportPreview();
   }
 }
 function resetExportResult() {
@@ -446,24 +446,52 @@ async function showExportResult() {
   setPreviewZoom(previewZoom);
   document.querySelector('#preview-progress').textContent='已导出';
 }
+function syncExportGeoreference() {
+  const available=sourceHasCrs(exportSourceStatus ?? renderStatus);
+  const checkbox=document.querySelector('#export-georeference');
+  if (!available) exportSettings.exportGeoreference=false;
+  checkbox.checked=!!exportSettings.exportGeoreference;
+  checkbox.disabled=!available || !!renderStatus?.exporting;
+}
 function setExportFormat(preserveSize = false) {
   const geotiff=document.querySelector('#export-format').value==='geotiff';
   const framing=document.querySelector('#export-framing');
-  if(geotiff) framing.value='source';
-  framing.disabled=geotiff || !!renderStatus?.exporting;
-  exportSettings.exportOrthographic=geotiff || framing.value==='source';
-  document.querySelector('#geo-options').hidden=!geotiff;
-  document.querySelector('#export-scale').disabled=geotiff || !!renderStatus?.exporting;
+  framing.disabled=!!renderStatus?.exporting;
+  exportSettings.exportOrthographic=framing.value==='source';
+  document.querySelector('#geo-options').hidden=!exportSettings.exportOrthographic;
+  document.querySelector('#export-scale').disabled=!!renderStatus?.exporting;
+  syncExportGeoreference();
   document.querySelector('#preview-kind').textContent=exportSettings.exportOrthographic?'原图正射':'当前视图';
   document.querySelector('#export-image').hidden=geotiff;
   document.querySelector('#export-geotiff').hidden=!geotiff;
-  if (preserveSize !== true) setExportScale(1);
+  if (preserveSize === false) setExportScale(1);
+  else if (preserveSize === true && !exportSettings.exportOrthographic) {
+    const multiplier=Number(document.querySelector('#export-scale').value);
+    const preset=[1,2,3].includes(multiplier);
+    const size=currentExportSize(preset?multiplier:1);
+    if (size) {
+      if (!preset) {
+        const scale=Math.max(exportSettings.width,exportSettings.height)/Math.max(size.width,size.height);
+        size.width=Math.max(1,Math.round(size.width*scale));
+        size.height=Math.max(1,Math.round(size.height*scale));
+      }
+      Object.assign(exportSettings,size);
+    }
+  }
   updateExportDimensions();
   scheduleExportPreview();
   if(typeof syncComboboxes==='function') syncComboboxes();
 }
 document.querySelector('#export-framing').addEventListener('change',() => setExportFormat());
-document.querySelector('#export-format').addEventListener('change', () => setExportFormat());
+document.querySelector('#export-format').addEventListener('change', () => {
+  setExportFormat('format');
+});
+document.querySelector('#export-georeference').addEventListener('change', event => {
+  if (renderStatus?.exporting) return;
+  exportSettings.exportGeoreference=sourceHasCrs(exportSourceStatus ?? renderStatus) && event.target.checked;
+  syncExportGeoreference();
+  scheduleExportPreview();
+});
 document.querySelector('#export-extent').addEventListener('change', event => {
   if (renderStatus?.exporting) return;
   exportSettings.exportShadow = event.target.value === 'shadow';
@@ -633,10 +661,7 @@ document.addEventListener('input', event => {
     if (exportKeys.has(key) || input.dataset.scope === 'export') {
       const normalized = normalizeParameter(key, value);
       if (key === 'width' || key === 'height') {
-        const size=proportionalSize(currentExportSize(),key,normalized);
-        size.width=normalizeParameter('width',size.width);
-        size.height=normalizeParameter('height',size.height);
-        Object.assign(exportSettings,size);
+        exportSettings[key]=normalized;
         document.querySelector('#export-scale').value = 'custom';
         if (typeof syncComboboxes === 'function') syncComboboxes();
       } else exportSettings[key]=normalized;

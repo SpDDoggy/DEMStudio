@@ -18,6 +18,9 @@ pub(super) fn source(dense: &str) -> Result<String, String> {
 
 pub(super) fn source_with_mrt(dense: &str, wide: bool) -> Result<String, String> {
     let mut shader = dense.to_owned();
+    if dense.contains("#define PRIM_BICUBIC")&&crate::renderer::bicubic_bounds::enabled("bicubic"){
+        shader=shader.replacen("#version 330 compatibility","#version 330 compatibility\n#define BC_PRECOMPUTED_BOUNDS",1);
+    }
     if wide { shader = shader.replacen("#version 330 compatibility", "#version 330 compatibility\n#define PG_WIDE_MRT", 1); }
     // Declarations referencing mipmap_tex_inv_size must follow its declaration.
     // The header is inserted immediately before the first height sampler body.
@@ -56,3 +59,5 @@ fn replace_function(source: &str, signature: &str, replacement: &str) -> Result<
     }
     Err("分页函数定义括号不完整".into())
 }
+
+

@@ -1,4 +1,4 @@
-//! Source-grid orthographic output. Callbacks return top-to-bottom straight RGBA.
+//! TIFF image output. Callbacks return top-to-bottom straight RGBA.
 //! RGBA16 samples use native endian; TIFF serializes values in its declared byte order.
 //! Streaming strips intentionally use no compression: tiff 0.11's public
 //! `write_strip` does not activate the compressor used by `write_data`.
@@ -112,8 +112,11 @@ fn temporary_file(path: &Path) -> Result<(PendingFile, File), String> {
 
 fn area_keys(geo: &GeoReference) -> Result<Vec<u16>, String> {
     let mut keys = geo.keys.clone();
-    if keys.len() < 4 || keys[0] != 1 || keys.len() < 4 + usize::from(keys[3]) * 4 {
-        return Err("源图像缺少有效 GeoTIFF 坐标系定义；仅有 WKT 的坐标系暂不能导出".into());
+    if !geo.has_crs() { return Err("源图像未定义可写出的地理坐标系".into()); }
+    // A custom WKT CRS is preserved by the caller's PAM sidecar. Do not invent
+    // an EPSG code; the TIFF itself still records its corner grid and Area type.
+    if !geo.has_embedded_crs() {
+        return Ok(vec![1, 1, 0, 1, 1025, 0, 1, 1]);
     }
     let entries_end = 4 + usize::from(keys[3]) * 4;
     let has_crs = keys[4..entries_end]
@@ -193,6 +196,14 @@ fn requires_bigtiff_depth(
     geo: &GeoReference,
     depth: u8,
 ) -> Result<bool, String> {
+    requires_bigtiff_image_depth(width, height, Some(geo), depth)
+}
+fn requires_bigtiff_image_depth(
+    width: u32,
+    height: u32,
+    geo: Option<&GeoReference>,
+    depth: u8,
+) -> Result<bool, String> {
     let sample_bytes = validate_depth(depth)?;
     let (_, rows) = strip_layout_depth(width, height, depth)?;
     let payload = u64::from(width)
@@ -202,9 +213,7 @@ fn requires_bigtiff_depth(
     // Reserve directory/tag payload, strip offsets/counts and alignment before choosing classic TIFF.
     let metadata = 65_536u64
         + u64::from(height.div_ceil(rows)) * 16
-        + geo.keys.len() as u64 * 2
-        + geo.doubles.len() as u64 * 8
-        + geo.ascii.len() as u64;
+        + geo.map_or(0, |g| g.keys.len() as u64 * 2 + g.doubles.len() as u64 * 8 + g.ascii.len() as u64);
     Ok(payload
         .checked_add(metadata)
         .ok_or("正射 TIFF 文件大小超出限制")?
@@ -218,17 +227,34 @@ fn write_grid_depth<F>(
     height: u32,
     geo: &GeoReference,
     depth: u8,
+    render_tile: F,
+) -> Result<(), String>
+where
+    F: FnMut(u32, u32, u32, u32) -> Result<Vec<u8>, String>,
+{
+    write_image_depth(path, width, height, Some(geo), depth, render_tile)
+}
+
+/// Write a camera or source-grid image; georeferencing never controls rendering.
+/// When a CRS cannot be represented by the retained GeoKeys, the caller writes
+/// the matching PAM sidecar after this image succeeds.
+pub fn write_image_depth<F>(
+    path: &Path,
+    width: u32,
+    height: u32,
+    geo: Option<&GeoReference>,
+    depth: u8,
     mut render_tile: F,
 ) -> Result<(), String>
 where
     F: FnMut(u32, u32, u32, u32) -> Result<Vec<u8>, String>,
 {
     let (_, rows) = strip_layout_depth(width, height, depth)?;
-    if !geo.valid() {
-        return Err("地理仿射变换无效".into());
+    if let Some(geo) = geo {
+        if !geo.valid() { return Err("地理仿射变换无效".into()); }
     }
-    let keys = area_keys(geo)?;
-    let big = requires_bigtiff_depth(width, height, geo, depth)?;
+    let keys = geo.map(area_keys).transpose()?.unwrap_or_default();
+    let big = requires_bigtiff_image_depth(width, height, geo, depth)?;
     let (pending, file) = temporary_file(path)?;
     let mut writer = BufWriter::new(file);
     if big {
@@ -274,7 +300,7 @@ fn encode_grid_depth<W: Write + Seek, K: TiffKind, F>(
     width: u32,
     height: u32,
     rows: u32,
-    geo: &GeoReference,
+    geo: Option<&GeoReference>,
     keys: &[u16],
     depth: u8,
     render_tile: &mut F,
@@ -311,7 +337,7 @@ fn encode_grid_samples<W: Write + Seek, K: TiffKind, F, C: ColorType>(
     width: u32,
     height: u32,
     rows: u32,
-    geo: &GeoReference,
+    geo: Option<&GeoReference>,
     keys: &[u16],
     render_tile: &mut F,
     convert: fn(&[u8]) -> C::Inner,
@@ -333,17 +359,21 @@ where
         .map_err(|e| e.to_string())?;
     dir.write_tag(Tag::ExtraSamples, &[2u16][..])
         .map_err(|e| e.to_string())?;
-    dir.write_tag(Tag::ModelTransformationTag, &matrix(geo)[..])
-        .map_err(|e| e.to_string())?;
-    dir.write_tag(Tag::GeoKeyDirectoryTag, keys)
-        .map_err(|e| e.to_string())?;
-    if !geo.doubles.is_empty() {
-        dir.write_tag(Tag::GeoDoubleParamsTag, &geo.doubles[..])
+    if let Some(geo) = geo {
+        dir.write_tag(Tag::ModelTransformationTag, &matrix(geo)[..])
             .map_err(|e| e.to_string())?;
-    }
-    if !geo.ascii.is_empty() {
-        dir.write_tag(Tag::GeoAsciiParamsTag, geo.ascii.as_str())
+        dir.write_tag(Tag::GeoKeyDirectoryTag, keys)
             .map_err(|e| e.to_string())?;
+        if geo.has_embedded_crs() {
+            if !geo.doubles.is_empty() {
+                dir.write_tag(Tag::GeoDoubleParamsTag, &geo.doubles[..])
+                    .map_err(|e| e.to_string())?;
+            }
+            if !geo.ascii.is_empty() {
+                dir.write_tag(Tag::GeoAsciiParamsTag, geo.ascii.as_str())
+                    .map_err(|e| e.to_string())?;
+            }
+        }
     }
     let row_samples = width as usize * 4;
     for y in (0..height).step_by(rows as usize) {
@@ -373,3 +403,5 @@ where
     image.finish().map_err(|e| e.to_string())?;
     Ok(())
 }
+
+

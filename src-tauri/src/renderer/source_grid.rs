@@ -22,7 +22,11 @@ impl SourceMetadata {
         if !value.is_finite() || self.nodata.is_some_and(|n| n == value) {
             return 0.;
         }
-        if self.normalized_input { return value as f32; }
+        if self.normalized_input {
+            // Image decoders supply 0..1 brightness, while the viewport uploads
+            // that brightness through the imported source-wide display range.
+            return super::gl_renderer::display_sample(value as f32, self.elevation_range.map(|v| v as f32));
+        }
         let [low, high] = self.elevation_range;
         let q = if high > low {
             ((value - low) / (high - low)) as f32
@@ -286,8 +290,12 @@ impl ExportGrid {
             let grid=SourceGrid::open(path,range,budget)?;
             return Ok(Self {metadata:grid.metadata.clone(),backend:ExportBackend::Tiff(grid)});
         }
+        let [low,high]=range;
+        if !low.is_finite() || !high.is_finite() || high<low {
+            return Err("源高程范围无效".into());
+        }
         let (width,height)=image_dimensions(path)?;
-        Ok(Self {metadata:SourceMetadata {width,height,nodata:None,elevation_range:[0.,1.],normalized_input:true},
+        Ok(Self {metadata:SourceMetadata {width,height,nodata:None,elevation_range:range,normalized_input:true},
             backend:ExportBackend::Image {path:path.to_owned(),scans:0}})
     }
     pub fn reduced_cells_align_with_chunks(&self, factor:u32)->bool {
@@ -420,3 +428,5 @@ fn image_rows(path:&Path,expected:[u32;2],mut emit:impl FnMut(u32,u32,&[f64])->R
     }
     Ok(())
 }
+
+

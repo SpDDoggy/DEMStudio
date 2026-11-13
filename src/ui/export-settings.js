@@ -1,7 +1,7 @@
 export const stretchKeys = ['stretchType', 'stretchDeviations', 'stretchLow', 'stretchHigh'];
 
 export const exportKeys = new Set(['width', 'height', 'samples', 'outputBitDepth', 'exportTerrainScale', 'exposure', 'gamma',
-  'exportOrthographic', 'outputContrast', 'outputSaturation', 'outputTemperature', 'outputShadows', 'outputHighlights', 'exportShadow', 'shadowPadding']);
+  'exportOrthographic', 'exportGeoreference', 'outputContrast', 'outputSaturation', 'outputTemperature', 'outputShadows', 'outputHighlights', 'exportShadow', 'shadowPadding']);
 
 export function createExportSettings(parameters) {
   return Object.fromEntries([...exportKeys, ...stretchKeys].map(key => [key, key === 'exportOrthographic' ? false : parameters[key]]));
@@ -11,6 +11,58 @@ export function exportSnapshot(parameters, settings) {
   return cloneScene({ ...parameters, ...settings, grid: false, contourEnabled: false,
     exposure: 1, gamma: 2.2, outputContrast: 0, outputSaturation: 0,
     outputTemperature: 0, outputShadows: 0, outputHighlights: 0 });
+}
+
+// Source framing and geographic metadata are independent of file encoding.
+export function exportRequest(parameters, settings) {
+  const params = exportSnapshot(parameters, settings);
+  params.exportShadow = params.exportOrthographic && params.exportShadow;
+  params.exportGeoreference = params.exportOrthographic && params.exportGeoreference;
+  return { orthographic: params.exportOrthographic, params };
+}
+
+// Match native georef::valid_wkt without resolving or changing the source CRS.
+function validSourceWkt(value) {
+  if (typeof value !== 'string') return false;
+  value=value.trim();
+  const open=value.indexOf('[');
+  if (open<0 || !['PROJCS','GEOGCS','GEOCCS','LOCAL_CS','COMPD_CS','VERT_CS','PROJCRS','GEOGCRS','GEODCRS','VERTCRS','ENGCRS','COMPOUNDCRS','BOUNDCRS','DERIVEDPROJCRS'].includes(value.slice(0,open).trim().toUpperCase())) return false;
+  const root=value.slice(0,open).trim().toUpperCase();
+  const body=value.slice(open+1).trimStart();
+  if (root==='BOUNDCRS' ? !/^SOURCECRS\s*\[/iu.test(body) : !body.startsWith('"')) return false;
+  let depth=0, quoted=false;
+  for (let i=open;i<value.length;i++) {
+    const c=value[i], code=c.charCodeAt(0);
+    if ((code<32 || code>=127 && code<=159) && !/\s/u.test(c)) return false;
+    if (c==='"') {
+      if (quoted && value[i+1]==='"') i++;
+      else quoted=!quoted;
+    } else if (!quoted) {
+      if (c==='[') depth++;
+      if (c===']' && --depth===0) return !value.slice(i+1).trim();
+      if (depth<0) return false;
+    }
+  }
+  return false;
+}
+
+export function sourceHasCrs(status) {
+  const geo = status?.source?.geo;
+  if (!geo) return false;
+  if (validSourceWkt(geo.wkt)) return true;
+  const keys = geo.keys;
+  if (!Array.isArray(keys) || keys.length < 4 || keys[0] !== 1) return false;
+  const count = keys[3];
+  if (!Number.isInteger(count) || keys.length < 4 + count * 4) return false;
+  const end = 4 + count * 4;
+  for (let i = 4; i < end; i += 4) {
+    const location=keys[i+1], length=keys[i+2], offset=keys[i+3];
+    if (!(length > 0) || !(location===0 ? length===1 : location===34735 ? offset>=end && offset+length<=keys.length : location===34736 ? offset+length<=(geo.doubles?.length ?? 0) && geo.doubles.slice(offset,offset+length).every(Number.isFinite) : location===34737 ? offset+length<=(geo.ascii?.length ?? 0)+1 : false)) return false;
+  }
+  for (let i = 4; i < 4 + count * 4; i += 4) {
+    if ([2048,3072].includes(keys[i]) && keys[i+1] === 0 && keys[i+2] === 1 && keys[i+3] > 0 && keys[i+3] !== 32767) return true;
+  }
+  return false;
 }
 
 export function previewScale(value) {

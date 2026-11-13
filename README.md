@@ -7,11 +7,11 @@
 **从高程数据到精致地形影像。**
 
 一款专注于数字高程模型（DEM）的 Windows 桌面渲染工具。  
-用直观的工作区塑造地形、调整光影，并将成果输出为高分辨率图像或带地理参考的 GeoTIFF。
+用直观的工作区塑造地形、调整光影，并将成果输出为 PNG 或 TIFF；原图正射可附带地理信息。
 
 ![DEMStudio 工作区](https://raw.githubusercontent.com/SpDDoggy/DEMStudio/92e6cff89cfe862cc178805eafde74578e0d5e04/assets/readme/hero.png)
 
-`Windows` · `Rust` · `Tauri 2` · `OpenGL` · `GLSL` · `v0.0.1`
+`Windows` · `Rust` · `Tauri 2` · `OpenGL` · `GLSL` · `v0.2.0`
 
 </div>
 
@@ -32,7 +32,7 @@ DEMStudio 将高度场渲染与地图制作连接起来：既可以独立制作�
 | **光照与成像** | 太阳、天空、软阴影、渐进采样、曝光与整体调色。 |
 | **交互工作区** | 以地形为中心的视口、浮动参数面板和视角导航。 |
 | **多种数据输入** | PNG、JPEG、TIFF / BigTIFF 与 ASC 高程栅格。 |
-| **专业输出** | 当前视图 PNG、正射 PNG，以及保留源栅格地理参考的正射 GeoTIFF。 |
+| **专业输出** | PNG / TIFF、8-bit / 16-bit；当前视图或原图正射，自定义尺寸与可选地理信息。 |
 
 ## 从渲染到地图
 
@@ -40,7 +40,7 @@ DEMStudio 将高度场渲染与地图制作连接起来：既可以独立制作�
 
 1. **导入** DEM 或高度图，建立地形。
 2. **塑造** 曲面、赋色、光照与相机视角。
-3. **渲染** 当前视图，或按原始像元网格输出正射成果。
+3. **渲染** 当前视图，或按完整原图范围输出正射成果。
 4. **制图** 将 GeoTIFF 加入 ArcGIS Pro，叠加湖泊、道路、地名等图层并完成排版。
 
 > **实际案例 · 云南滇池**  
@@ -51,7 +51,7 @@ DEMStudio 将高度场渲染与地图制作连接起来：既可以独立制作�
 
 ## 获取与运行
 
-当前项目面向 **Windows**，仓库配置尚未启用安装包构建。可直接从源码运行。
+下载 [DEMStudio 0.2.0](https://github.com/SpDDoggy/DEMStudio/releases/tag/v0.2.0)：提供 Windows x64 安装包和便携版。也可从下列完整源码构建。
 
 **环境要求**
 
@@ -72,7 +72,7 @@ cargo run --release --locked --manifest-path src-tauri/Cargo.toml
 cargo build --release --locked --manifest-path src-tauri/Cargo.toml
 ```
 
-构建结果位于 `src-tauri/target/release/demstudio.exe`。首次构建需要下载 Cargo 依赖。界面使用原生 HTML、CSS 和 JavaScript，无需 npm 构建步骤。
+构建结果位于 `build/tauri/release/demstudio.exe`。首次构建需要下载 Cargo 依赖。界面使用原生 HTML、CSS 和 JavaScript，无需 npm 构建步骤。
 
 ## 基本操作
 
@@ -84,11 +84,11 @@ cargo build --release --locked --manifest-path src-tauri/Cargo.toml
 | 切换标准视角 | 方向立方体 / 底部视角工具 |
 | 输出图像 | 导出面板中选择当前视图或正射输出 |
 
-### 关于 GeoTIFF
+### 地理信息导出
 
-正射 GeoTIFF 输出沿用源栅格的像元网格和地理参考信息，便于在 GIS 中进行空间叠加。**DEMStudio 不负责重投影**；导入 GIS 后仍应检查坐标参考系统、像元对齐及 NoData 区域，尤其是在正式制图或测量用途下。
+选择“原图正射”后，源数据自带坐标系时可勾选“导出地理信息”。PNG 和 TIFF 均可使用；PNG 的坐标信息保存在同名 `.png.aux.xml` 中，导入 GIS 时请保留配套文件。自定义坐标系的 TIFF 也可能附带 `.tif.aux.xml`。
 
-大栅格采用有界预览策略；预览分辨率与最终导出尺寸并非同一概念。实际处理速度与可用输出规模取决于数据、显存及硬件环境。
+原图正射保持完整源范围，按输出宽高计算像元大小；阴影外扩同步平移地理原点。当前视图保留相机取景。大栅格采用有界预览与源精度分页导出，预览细节与最终文件精度可分别选择。
 
 ## 技术实现
 
@@ -109,9 +109,9 @@ DEMStudio/
 
 ## 当前状态
 
-**v0.0.1 · 早期开发阶段**
+**v0.2.0**
 
-项目已具备地形导入、交互渲染与 PNG / GeoTIFF 输出能力，但仍处于持续开发阶段。跨平台支持、完整安装包分发、更多自动化测试及大规模数据基准测试尚待完善。
+支持地形导入、交互渲染、源精度分页导出及带地理参考的 PNG / TIFF 输出。仓库包含 Rust / OpenGL 渲染核心、GLSL、栅格读取和文件输出的完整构建依赖。
 
 ---
 

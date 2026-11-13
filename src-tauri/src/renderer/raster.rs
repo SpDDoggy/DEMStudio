@@ -447,10 +447,7 @@ fn tiff(path: &Path, limit: PreviewLimit) -> Result<HeightMap, String> {
     let nx = w.div_ceil(cw);
     let ny = h.div_ceil(ch);
     nx.checked_mul(ny).ok_or("TIFF 分块数量超出可寻址范围")?;
-    let geo = match georef::read_tiff(&mut decoder)? {
-        Some(g) => Some(g),
-        None => georef::read_sidecars(path)?,
-    };
+    let geo = georef::read_tiff_with_sidecars(&mut decoder,path)?;
     let nodata = decoder
         .get_tag_ascii_string(Tag::GdalNodata)
         .ok()
@@ -647,3 +644,5 @@ fn tiff_chunk_budget(w: u32, h: u32, bands: usize, bits: u8) -> Result<(), Strin
         Ok(())
     }
 }
+
+

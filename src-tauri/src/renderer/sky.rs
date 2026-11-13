@@ -158,3 +158,5 @@ fn in_scatter(dir: [f64; 3], sun: [f64; 3]) -> [f64; 3] {
 fn luminance(rgb: [f64; 3]) -> f64 {
     rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722
 }
+
+

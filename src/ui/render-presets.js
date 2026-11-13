@@ -3,7 +3,7 @@ import { createExportSettings, cloneScene } from './export-settings.js';
 
 export const presetStorageKey = 'demstudio.render-presets.v1';
 const version = 1;
-const excluded = new Set(['experimentalBounces','width','height','samples','exposure','gamma','outputContrast','outputSaturation','outputTemperature','outputShadows','outputHighlights','exportShadow','shadowPadding','outputBitDepth','exportTerrainScale']);
+const excluded = new Set(['experimentalBounces','width','height','samples','exposure','gamma','outputContrast','outputSaturation','outputTemperature','outputShadows','outputHighlights','exportShadow','exportGeoreference','shadowPadding','outputBitDepth','exportTerrainScale']);
 const sceneKeys = Object.keys(fields).filter(key => !excluded.has(key));
 function validateObject(value, keys) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('预设无效');
@@ -28,7 +28,8 @@ export function validatePresetSettings(value) {
   if (!Object.hasOwn(value.parameters, 'skyIntensity')) parameters.skyIntensity = parameters.skyModel === 'atmosphere' ? 45 : 100;
   const output = {...defaults.output, ...validateObject(value.output,Object.keys(defaults.output).filter(key => key!=='exportOrthographic'))};
   if (typeof value.output?.exportOrthographic !== 'boolean') throw new Error('预设无效');
-  output.exportOrthographic = value.format==='geotiff' || value.framing==='source';
+  output.exportOrthographic = value.framing==='source';
+  if (!Object.hasOwn(value.output ?? {}, 'exportGeoreference')) output.exportGeoreference = value.format==='geotiff';
   return cloneScene({parameters, output, format:value.format, framing:value.framing, scale:value.scale});
 }
 export function applyPresetSettings(parameters, output, settings, textureAvailable=false) {

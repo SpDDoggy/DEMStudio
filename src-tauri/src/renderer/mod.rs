@@ -12,7 +12,38 @@ mod tiff_stream;
 mod source_grid;
 mod paged_source;
 mod paged_shader;
-mod resident_shader;
+mod raystate_shader;
+mod compact_feedback;
+mod active_queue;
+mod phase_queue;
+mod wavefront_queue;
+mod async_samples;
+mod async_active_queue;
+mod sample_wavefront;
+mod wavefront_runtime;
+mod sample_wavefront_shader;
+mod gpu_batch;
+mod bicubic_profile;
+mod walk_profile;
+mod bicubic_bounds;
+mod bicubic_static;
+mod bicubic_leaf;
+mod bicubic_rows;
+mod tight_bounds;
+mod geo_merged;
+mod ancestor_seed;
+mod directional_skip;
+
+
+
+
+
+
+
+mod visibility_bounds;
+mod visibility_probe;
+mod visibility_diagnostic;
+
 pub mod thumbnail;
 
 use serde::{Deserialize, Serialize};
@@ -120,6 +151,7 @@ pub struct RenderParams {
     pub grid: bool,
     pub export_shadow: bool,
     pub export_orthographic: bool,
+    pub export_georeference: bool,
     pub shadow_padding: f32,
 }
 
@@ -200,6 +232,7 @@ impl Default for RenderParams {
             grid: true,
             export_shadow: false,
             export_orthographic: false,
+            export_georeference: false,
             shadow_padding: 20.,
         }
     }
@@ -254,3 +287,13 @@ pub struct RenderStatus {
     pub texture_width: u32,
     pub texture_height: u32,
 }
+
+mod page_scheduler;
+
+mod page_prefetch;
+
+
+
+
+
+

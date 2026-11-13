@@ -91,22 +91,54 @@ fn export_preview_params(
 
 /// Geometry resolution is independent of output pixels and georeferencing.
 #[derive(Debug, PartialEq)]
-enum ExportTerrainPlan { Preview, Dense(u32), Paged(u32) }
+enum ExportTerrainPlan { Preview, Paged(u32) }
 
-fn export_terrain_plan(
-    width: u32, height: u32, gpu_limit: u32, _tiff: bool, mode: &str,
-) -> Result<ExportTerrainPlan,String> {
-    let factor=match mode {
-        "preview"=>return Ok(ExportTerrainPlan::Preview),
-        "source"=>1,"half"=>2,"quarter"=>4,
-        _=>return Err("无效的导出地形精度".into()),
-    };
-    let edge=width.max(height).div_ceil(factor).max(2);
-    let dense_limit=gpu_limit.min(super::raster::MAX_DECODE_EDGE);
-    if edge.checked_next_power_of_two().is_some_and(|padded|padded<=dense_limit) {
-        Ok(ExportTerrainPlan::Dense(edge))
-    } else {
-        Ok(ExportTerrainPlan::Paged(factor))
+// Diagnostic wall-clock intervals overlap GPU execution; never add them to GPU timers.
+struct ExportDiagnostic {
+    started: Instant,
+    id: String,
+    params: serde_json::Value,
+    preparation: f64,
+    callbacks: f64,
+    readback: f64,
+    thumbnail: f64,
+    writer: f64,
+    outcome: String,
+}
+impl ExportDiagnostic {
+    fn new(params: &RenderParams) -> Self {
+        let stamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        Self { started:Instant::now(), id:format!("{}-{stamp}",std::process::id()),
+            params:serde_json::to_value(params).unwrap_or_default(), preparation:0.,callbacks:0.,
+            readback:0.,thumbnail:0.,writer:0.,outcome:"preparation_failed".into() }
+    }
+    fn report(&self) -> serde_json::Value {
+        serde_json::json!({"build_identity":"D055-profile-20261110","diagnostic_test":std::env::var_os("DEMSTUDIO_TEST_SOURCE").is_some(), "session_id":self.id,
+            "parameters":self.params,"outcome":self.outcome,"total_wall_seconds":self.started.elapsed().as_secs_f64(),
+            "preparation_wall_seconds":self.preparation,"render_callbacks_wall_seconds":self.callbacks,
+            "output_readback_wall_seconds":self.readback,"thumbnail_wall_seconds":self.thumbnail,
+            "writer_including_callbacks_wall_seconds":self.writer,
+            "encoding_and_write_residual_wall_seconds":(self.writer-self.callbacks).max(0.),
+            "timing_scope":"Overlapping CPU wall intervals; readback includes GPU wait and display conversion. Writer residual excludes callbacks but combines encoding and file IO; not pure disk time."})
+    }
+}
+impl Drop for ExportDiagnostic {
+    fn drop(&mut self) {
+        if let Ok(bytes)=serde_json::to_vec_pretty(&self.report()) {
+            let _=std::fs::write(std::env::temp_dir().join(format!("DEMStudio-native-performance-{}.json",self.id)),bytes);
+        }
+    }
+}
+
+/// Every source-backed resolution uses the same bounded page address space.
+/// Cache capacity may cover all pages; that never selects another integrator.
+fn export_terrain_plan(mode: &str) -> Result<ExportTerrainPlan,String> {
+    match mode {
+        "preview"=>Ok(ExportTerrainPlan::Preview),
+        "source"=>Ok(ExportTerrainPlan::Paged(1)),
+        "half"=>Ok(ExportTerrainPlan::Paged(2)),
+        "quarter"=>Ok(ExportTerrainPlan::Paged(4)),
+        _=>Err("无效的导出地形精度".into()),
     }
 }
 
@@ -115,10 +147,9 @@ unsafe fn prepare_export_terrain(
     geo:bool, cancel:&AtomicBool,status:&Arc<Mutex<RenderStatus>>,
 ) -> Result<Option<PagedExport>,String> {
     if cancel.load(Ordering::Acquire){return Err("已取消导出".into());}
-    let Some(source)=&preview.source else {return Ok(None);};
-    let tiff=source.path.extension().and_then(|ext|ext.to_str())
-        .is_some_and(|ext|ext.eq_ignore_ascii_case("tif")||ext.eq_ignore_ascii_case("tiff"));
-    match export_terrain_plan(source.width,source.height,renderer.heightmap_edge_limit(),tiff,&desired.export_terrain_scale)? {
+    if preview.source.is_none() {return Ok(None);}
+    let plan=export_terrain_plan(&desired.export_terrain_scale)?;
+    match plan {
         ExportTerrainPlan::Preview=>Ok(None),
         ExportTerrainPlan::Paged(factor)=>{
             let mut last=0;
@@ -127,18 +158,6 @@ unsafe fn prepare_export_terrain(
                 if percent!=last {status.lock().unwrap_or_else(|e|e.into_inner()).export_progress=percent;last=percent;}
             }).map(Some)
         },
-        ExportTerrainPlan::Dense(edge)=>{
-            let full=super::raster::load(&source.path,edge)?;
-            if cancel.load(Ordering::Acquire){return Err("已取消导出".into());}
-            let loaded=full.source.as_ref().ok_or("重新读取的源图像无效")?;
-            let same_geo=serde_json::to_value(&source.geo).map_err(|e|e.to_string())?
-                ==serde_json::to_value(&loaded.geo).map_err(|e|e.to_string())?;
-            if loaded.width!=source.width || loaded.height!=source.height || !same_geo {
-                return Err("源图像尺寸或地理参考已改变，请重新导入后导出".into());
-            }
-            renderer.upload_map(&full)?;
-            Ok(None)
-        }
     }
 }
 
@@ -153,6 +172,7 @@ unsafe fn render_export_tile(
     renderer:&mut GlRenderer, paged:&mut Option<PagedExport>, desired:&RenderParams,
     full_size:[u32;2], tile:[u32;4], geo:bool,
     completed:&mut u64,total:u64,status:&Arc<Mutex<RenderStatus>>,cancel:&AtomicBool,
+    diagnostic:&mut ExportDiagnostic,
 ) -> Result<Vec<u8>,String> {
     let [x,y,width,height]=tile;
     if *completed == 0 {
@@ -175,11 +195,11 @@ unsafe fn render_export_tile(
         while renderer.samples()<desired.samples.max(1) {
             if cancel.load(Ordering::Acquire){return Err("已取消导出".into());}
             let finished=match paged.as_mut() {
-                Some(source)=>renderer.render_source_sample(source,cancel)?,
-                None=>renderer.render_export_sample_step()?,
+                Some(source)=>renderer.render_source_batch(source,cancel,desired.samples.max(1)-renderer.samples())?,
+                None=>u32::from(renderer.render_export_sample_step()?),
             };
-            if finished {
-                *completed+=u64::from(w)*u64::from(h);
+            if finished>0 {
+                *completed+=u64::from(w)*u64::from(h)*u64::from(finished);
                 let mut state=status.lock().unwrap_or_else(|e|e.into_inner());
                 state.export_work_progress=Some((*completed as f64 * 100. / total.max(1) as f64).min(100.));
                 state.export_progress=
@@ -188,7 +208,13 @@ unsafe fn render_export_tile(
             }
         }
         if let Some(source)=paged.as_mut(){renderer.finish_source_surface(source,cancel)?;}
-        let pixels=renderer.export_pixels_for_output()?;
+        let readback_started=Instant::now();
+        let pixels=match paged.as_mut() {
+            Some(source)=>renderer.profile_source_output(source),
+            None=>renderer.export_pixels_for_output(),
+        };
+        diagnostic.readback+=readback_started.elapsed().as_secs_f64();
+        let pixels=pixels?;
         let part_row=w as usize*pixel_bytes;
         if pixels.len()!=part_row*h as usize{return Err("导出分块像素数量无效".into());}
         for row in 0..h as usize {
@@ -1123,6 +1149,8 @@ struct WglContext {
     dc: HDC,
     context: HGLRC,
 }
+
+
 impl Drop for WglContext {
     fn drop(&mut self) {
         unsafe {
@@ -1190,50 +1218,7 @@ unsafe fn export_source_grid(
     status: &Arc<Mutex<RenderStatus>>,
     cancel: &AtomicBool,
 ) -> Result<ExportFrame, String> {
-    let check_cancel = || {
-        if cancel.load(Ordering::Acquire) {
-            Err("已取消 TIFF 导出".to_string())
-        } else {
-            Ok(())
-        }
-    };
-    check_cancel()?;
-    let source = preview.source.as_ref().ok_or("当前地形没有源图像")?;
-    if source.geo.is_none() {
-        return Err("源图像没有地理坐标，无法导出带坐标系的 TIFF".into());
-    }
-    let mut paged=prepare_export_terrain(renderer,preview,desired,true,cancel,status)?;
-    let result=(||->Result<ExportFrame,String>{
-    let extent =
-        super::export_extent::ExportExtent::for_source(source.width, source.height, desired)?;
-    renderer.set_geo_grid(Some([source.width, source.height, extent.left, extent.top]))?;
-    let samples = desired.samples.max(1);
-    let total = u64::from(extent.width) * u64::from(extent.height) * u64::from(samples);
-    let mut completed = 0u64;
-    let mut thumbnail = Thumbnail::new(extent.width, extent.height)?;
-    freeze_export_stretch_with_source(renderer, desired, [extent.width,extent.height], true, cancel, &mut paged)?;
-    super::geotiff::write_orthographic_extent_depth(
-        path,
-        source,
-        extent.width,
-        extent.height,
-        extent.left,
-        extent.top,
-        desired.output_bit_depth,
-        |x, y, width, height| {
-            check_cancel()?;
-            let mut params=desired.clone();params.projection="orthographic".into();
-            let pixels=render_export_tile(renderer,&mut paged,&params,[extent.width,extent.height],
-                [x,y,width,height],true,&mut completed,total,status,cancel)?;
-            let preview = output_thumbnail_bytes(&pixels, desired.output_bit_depth);
-            thumbnail.add_tile(x, y, width, height, &preview)?;
-            Ok(pixels)
-        },
-    )?;
-    thumbnail.finish()
-    })();
-    if let Some(source)=paged.take(){renderer.end_source_export(source);}
-    result
+    export_image(renderer, preview, desired, path, status, cancel, true)
 }
 
 // One bounded, whole-frame statistics pass is frozen for all output tiles.
@@ -1273,18 +1258,11 @@ unsafe fn freeze_export_stretch_with_source(
     Ok(())
 }
 
-/// Orthographic PNG covers the complete source footprint independently of CRS.
-fn validate_orthographic_png_size(map: &HeightMap, params: &RenderParams) -> Result<(), String> {
-    let (width, height) = map.source.as_ref().map(|source| (source.width, source.height))
-        .unwrap_or((map.width, map.height));
-    if params.width == 0 || params.height == 0 { return Err("PNG 输出尺寸无效".into()); }
-    let expected_height = f64::from(params.width) * f64::from(height) / f64::from(width);
-    let expected_width = f64::from(params.height) * f64::from(width) / f64::from(height);
-    if (f64::from(params.height) - expected_height).abs() > 0.5
-        && (f64::from(params.width) - expected_width).abs() > 0.5 {
-        return Err("正射 PNG 尺寸须保持原图比例".into());
-    }
-    Ok(())
+fn export_image_extent(params: &RenderParams) -> Result<super::export_extent::ExportExtent,String> {
+    if params.width == 0 || params.height == 0 { return Err("输出尺寸无效".into()); }
+    let mut effective=params.clone();
+    effective.export_shadow &= effective.export_orthographic;
+    super::export_extent::ExportExtent::for_source(params.width,params.height,&effective)
 }
 
 unsafe fn export_camera_png(
@@ -1295,52 +1273,76 @@ unsafe fn export_camera_png(
     status: &Arc<Mutex<RenderStatus>>,
     cancel: &AtomicBool,
 ) -> Result<ExportFrame, String> {
-    if cancel.load(Ordering::Acquire) { return Err("已取消 PNG 导出".into()); }
-    if desired.width == 0 || desired.height == 0
-        || desired.width > super::png_output::MAX_EDGE || desired.height > super::png_output::MAX_EDGE {
-        return Err("PNG 输出尺寸超出范围".into());
-    }
+    export_image(renderer, preview, desired, path, status, cancel, false)
+}
+
+unsafe fn export_image(
+    renderer: &mut GlRenderer, preview: &HeightMap, desired: &RenderParams,
+    path: &Path, status: &Arc<Mutex<RenderStatus>>, cancel: &AtomicBool, tiff: bool,
+) -> Result<ExportFrame,String> {
+    let cancelled=if tiff {"已取消 TIFF 导出"} else {"已取消 PNG 导出"};
+    if cancel.load(Ordering::Acquire) { return Err(cancelled.into()); }
     let mut params = desired.clone();
     params.grid = false;
-    if params.export_orthographic {
-        params.export_shadow = false;
-        params.projection = "orthographic".into();
+    if params.export_orthographic { params.projection = "orthographic".into(); }
+    let extent=export_image_extent(&params)?;
+    if extent.width > super::png_output::MAX_EDGE || extent.height > super::png_output::MAX_EDGE {
+        return Err("输出尺寸超出范围".into());
     }
-    if params.export_orthographic {validate_orthographic_png_size(preview,&params)?;}
-    let mut paged=prepare_export_terrain(renderer,preview,&params,params.export_orthographic,cancel,status)?;
+    let geo=if params.export_orthographic && params.export_georeference {
+        let source=preview.source.as_ref().ok_or("源图像没有坐标系")?;
+        let geo=source.geo.as_ref().filter(|geo|geo.has_crs()).ok_or("源图像没有坐标系")?;
+        Some(geo.resized_grid(source.width,source.height,params.width,params.height,extent.left,extent.top)?)
+    } else {None};
+    super::georef::validate_output_sidecars(path,geo.is_some())?;
+    let mut diagnostic=ExportDiagnostic::new(&params);
+    let mut paged=prepare_export_terrain(renderer,preview,&params,params.export_orthographic,cancel,status)
+        .map_err(|e|if e=="已取消导出" {cancelled.to_owned()} else {e})?;
+    diagnostic.preparation=diagnostic.started.elapsed().as_secs_f64();
     let result=(||->Result<ExportFrame,String>{
     if params.export_orthographic {
-        validate_orthographic_png_size(preview, &params)?;
-        // Original footprint only; GeoTIFF shadow expansion stays separate.
-        params.export_shadow = false;
-        params.projection = "orthographic".into();
         renderer.set_output_tile(None)?;
-        renderer.set_geo_grid(Some([params.width, params.height, 0, 0]))?;
+        renderer.set_geo_grid(Some([params.width, params.height, extent.left, extent.top]))?;
     } else {
         renderer.set_geo_tile(None)?;
     }
     let samples = params.samples.max(1);
-    let total = u64::from(params.width) * u64::from(params.height) * u64::from(samples);
+    let total = u64::from(extent.width) * u64::from(extent.height) * u64::from(samples);
     let mut completed = 0u64;
-    let mut thumbnail = Thumbnail::new(params.width, params.height)?;
-    freeze_export_stretch_with_source(renderer, &params, [params.width,params.height], params.export_orthographic, cancel, &mut paged)?;
-    super::png_output::write_depth(
-        path,
-        params.width,
-        params.height,
-        params.output_bit_depth,
-        |x, y, width, height| {
-            if cancel.load(Ordering::Acquire) { return Err("已取消 PNG 导出".into()); }
-            let pixels=render_export_tile(renderer,&mut paged,&params,[params.width,params.height],
-                [x,y,width,height],params.export_orthographic,&mut completed,total,status,cancel)?;
+    let mut thumbnail = Thumbnail::new(extent.width, extent.height)?;
+    freeze_export_stretch_with_source(renderer, &params, [extent.width,extent.height], params.export_orthographic, cancel, &mut paged)?;
+    let writer_started=Instant::now();
+    let mut render_tile = |x, y, width, height| {
+            if cancel.load(Ordering::Acquire) { return Err(cancelled.into()); }
+            let callback_started=Instant::now();
+            let pixels=render_export_tile(renderer,&mut paged,&params,[extent.width,extent.height],
+                [x,y,width,height],params.export_orthographic,&mut completed,total,status,cancel,&mut diagnostic);
+            let pixels=match pixels {Ok(p)=>p,Err(e)=>{diagnostic.callbacks+=callback_started.elapsed().as_secs_f64();return Err(e)}};
+            let thumbnail_started=Instant::now();
             let preview = output_thumbnail_bytes(&pixels, params.output_bit_depth);
-            thumbnail.add_tile(x, y, width, height, &preview)?;
+            let added=thumbnail.add_tile(x, y, width, height, &preview);
+            diagnostic.thumbnail+=thumbnail_started.elapsed().as_secs_f64();
+            diagnostic.callbacks+=callback_started.elapsed().as_secs_f64();
+            added?;
             Ok(pixels)
-        },
-    )?;
+        };
+    let written=if tiff {
+        super::geotiff::write_image_depth(path,extent.width,extent.height,geo.as_ref(),params.output_bit_depth,&mut render_tile)
+    } else {
+        super::png_output::write_depth(path,extent.width,extent.height,params.output_bit_depth,&mut render_tile)
+    };
+    diagnostic.writer=writer_started.elapsed().as_secs_f64();
+    written?;
+    if let Some(geo)=geo.as_ref() { super::georef::write_png_aux(path,geo)?; }
+    else {super::georef::clear_output_aux(path)?;}
     thumbnail.finish()
     })();
-    if let Some(source)=paged.take(){renderer.end_source_export(source);}
+    let result=result.map_err(|e|if e=="已取消导出" {cancelled.to_owned()} else {e});
+    diagnostic.outcome=match &result {Ok(_)=>"completed".into(),Err(e)=>e.clone()};
+    if let Some(mut source)=paged.take(){
+        renderer.set_source_export_context(&mut source,diagnostic.report());
+        renderer.end_source_export(source);
+    }
     result
 }
 
@@ -1679,41 +1681,23 @@ unsafe fn render_thread(
                     let result = (|| -> Result<_, String> {
                         let map = current_preview.as_ref().ok_or("尚无高度图")?;
                         let mut snapshot = export_params(&desired, params);
-                        let png_orthographic = !orthographic && snapshot.export_orthographic;
-                        if png_orthographic {
-                            validate_orthographic_png_size(map, &snapshot)?;
-                            snapshot.export_shadow = false;
-                            snapshot.projection = "orthographic".into();
-                        }
-                        let source_size = map.source.as_ref().map(|source| [source.width, source.height])
-                            .unwrap_or([map.width, map.height]);
-                        let extent = if orthographic {
-                            Some(if map.source.is_some() {
-                                super::export_extent::ExportExtent::for_source(source_size[0], source_size[1], &snapshot)?
-                            } else {
-                                super::export_extent::shadow_extent(map, &snapshot)?
-                            })
-                        } else { None };
-                        let output_size = extent.map(|extent| [extent.width, extent.height])
-                            .unwrap_or([snapshot.width, snapshot.height]);
+                        snapshot.export_orthographic |= orthographic;
+                        if snapshot.export_orthographic {snapshot.projection="orthographic".into();}
+                        let base_size=[snapshot.width,snapshot.height];
+                        let extent=export_image_extent(&snapshot)?;
+                        let output_size=[extent.width,extent.height];
+                        let source_framing=snapshot.export_orthographic;
                         let params = export_preview_params(
-                            &desired,
-                            Some(snapshot),
-                            extent.map(|extent| (extent.width, extent.height)),
+                            &desired, Some(snapshot), Some((extent.width,extent.height)).filter(|_|source_framing),
                         );
                         renderer.set_output_tile(None)?;
                         renderer.set_params(&params)?;
-                        if let Some(extent) = extent {
-                            renderer.set_geo_grid(Some([source_size[0], source_size[1], extent.left, extent.top]))?;
-                            renderer.set_geo_tile(Some([0, 0, extent.width, extent.height]))?;
-                        } else if png_orthographic {
-                            renderer.set_geo_grid(Some([output_size[0], output_size[1], 0, 0]))?;
-                            renderer.set_geo_tile(Some([0, 0, output_size[0], output_size[1]]))?;
-                        } else {
-                            renderer.set_geo_tile(None)?;
-                        }
+                        if source_framing {
+                            renderer.set_geo_grid(Some([base_size[0],base_size[1],extent.left,extent.top]))?;
+                            renderer.set_geo_tile(Some([0,0,extent.width,extent.height]))?;
+                        } else {renderer.set_geo_tile(None)?;}
                         freeze_export_stretch(
-                            &mut renderer, &params, output_size, orthographic || png_orthographic, &AtomicBool::new(false),
+                            &mut renderer, &params, output_size, source_framing, &AtomicBool::new(false),
                         )?;
                         renderer.set_params(&params)?;
                         renderer.reset_accumulation();
@@ -1878,3 +1862,11 @@ unsafe fn render_thread(
     drop(renderer);
     Ok(())
 }
+
+
+
+
+
+
+
+

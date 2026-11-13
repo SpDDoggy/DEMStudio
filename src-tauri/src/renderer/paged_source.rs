@@ -32,6 +32,8 @@ pub(super) struct PagedSource {
     curve: f32,
     resident_budget: usize,
     resident: Option<std::sync::Arc<Vec<f32>>>,
+    tight_coarse: Option<Vec<MipLevel>>,
+    visibility_coarse: Option<Vec<super::visibility_bounds::BoundsLevel>>,
 }
 fn valid(m: &SourceMetadata, v: f64) -> bool {
     v.is_finite() && !m.nodata.is_some_and(|n| n == v)
@@ -91,7 +93,7 @@ impl PagedSource {
         progress(0, 0)?;
         let original = preview.source.as_ref().ok_or("源精度导出缺少原始文件")?;
         if !super::source_grid::is_tiff(&original.path) {
-            let result=Self::open(&original.path,[0.,1.],factor,curve,geo_halo,cache_budget)?;
+            let result=Self::open(&original.path,preview.display_range.map(f64::from),factor,curve,geo_halo,cache_budget)?;
             if [result.source.metadata.width,result.source.metadata.height]!=[original.width,original.height] {
                 return Err("源文件尺寸已改变，请重新导入".into());
             }
@@ -110,10 +112,7 @@ impl PagedSource {
         if dimensions != (original.width, original.height) {
             return Err("源文件尺寸已改变，请重新导入".into());
         }
-        let geo = match super::georef::read_tiff(&mut decoder)? {
-            Some(value) => Some(value),
-            None => super::georef::read_sidecars(&original.path)?,
-        };
+        let geo = super::georef::read_tiff_with_sidecars(&mut decoder,&original.path)?;
         if serde_json::to_value(&geo).map_err(|e| e.to_string())?
             != serde_json::to_value(&original.geo).map_err(|e| e.to_string())?
         {
@@ -214,6 +213,8 @@ impl PagedSource {
             curve,
             resident_budget: 0,
             resident: None,
+            tight_coarse: None,
+            visibility_coarse: None,
         })
     }
     pub fn set_resident_budget(&mut self, bytes: usize) { self.resident_budget = bytes; }
@@ -222,6 +223,12 @@ impl PagedSource {
         self.resident = samples;
     }
     pub fn resident_bytes(&self) -> usize { self.resident.as_ref().map_or(0, |v| v.len()*4) }
+    pub fn tight_coarse_levels(&self) -> Result<Vec<MipLevel>, String> {
+        self.tight_coarse.clone().ok_or_else(|| "紧层级尚未完成源扫描".into())
+    }
+    pub fn visibility_coarse_levels(&self) -> Result<Vec<super::visibility_bounds::BoundsLevel>, String> {
+        self.visibility_coarse.clone().ok_or_else(|| "可见性粗层尚未完成源扫描".into())
+    }
 
     pub fn metadata(&self) -> &SourceMetadata {
         &self.source.metadata
@@ -352,6 +359,16 @@ impl PagedSource {
         let curve = self.curve;
         let n = self.padded_size >> COARSE_LEVEL;
         let mut coarse = vec![0f32; (n * n) as usize];
+        let mut tight = if std::env::var("DEMSTUDIO_TIGHT_BOUNDS").as_deref()==Ok("on") {
+            let padded=self.logical_size[0].max(self.logical_size[1]).checked_add(self.geo_halo*2)
+                .and_then(u32::checked_next_power_of_two).ok_or("紧层级尺寸溢出")?.max(32);
+            Some(super::tight_bounds::CoarseAccumulator::new(self.logical_size,padded,self.geo_halo)?)
+        }else{None};
+        let mut visibility = if std::env::var("DEMSTUDIO_VISIBILITY_PROBE").as_deref()==Ok("on") {
+            let padded=self.logical_size[0].max(self.logical_size[1]).checked_add(self.geo_halo*2)
+                .and_then(u32::checked_next_power_of_two).ok_or("可见性粗层尺寸溢出")?.max(32);
+            Some(super::visibility_bounds::CoarseAccumulator::new(self.logical_size,padded,self.geo_halo)?)
+        }else{None};
         // Capture the already normalized logical source during this mandatory
         // scan. Bounded by available RAM; never creates a disk cache.
         let samples = (u64::from(w)*u64::from(h)) as usize;
@@ -399,6 +416,8 @@ impl PagedSource {
                     );
                     if let Some(data) = resident.as_mut() { data[(ly*w+lx) as usize] = value; }
                     project_max(&mut coarse, n, lx, gy, w, h, value);
+                    if let Some(builder)=tight.as_mut(){builder.project_sample(lx,gy,value)?;}
+                    if let Some(builder)=visibility.as_mut(){builder.project_sample(lx,gy,value)?;}
                 }
             } else if row.seen > expected {
                 return Err("源分页扫描行重复".into());
@@ -409,6 +428,8 @@ impl PagedSource {
             return Err("源分页扫描行不完整".into());
         }
         self.resident = resident.map(std::sync::Arc::new);
+        self.tight_coarse = tight.map(|builder|builder.finish()).transpose()?;
+        self.visibility_coarse = visibility.map(|builder|builder.finish()).transpose()?;
         let mut levels = vec![MipLevel {
             level: COARSE_LEVEL,
             edge: n,
@@ -454,3 +475,5 @@ fn project_max(out: &mut [f32], n: u32, x: u32, y: u32, w: u32, h: u32, value: f
         }
     }
 }
+
+
