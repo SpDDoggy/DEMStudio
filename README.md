@@ -61,7 +61,7 @@ DEMStudio 将高度场渲染与地图制作连接起来：既可以独立制作�
 
 下载 [DEMStudio 0.3.0](https://github.com/SpDDoggy/DEMStudio/releases/tag/v0.3.0)：提供 [Windows x64 单文件 EXE](https://github.com/SpDDoggy/DEMStudio/releases/download/v0.3.0/DEMStudio-0.3.0-windows-x64.exe)，下载后直接运行（需系统已有 WebView2 Runtime）。也可从下列完整源码构建。
 
-配套资料：[反弹次数选参技巧](https://github.com/SpDDoggy/DEMStudio/releases/download/v0.3.0/DEMStudio-0.3.0-bounce-guide.zip) · [采样、地形与光照技巧](https://github.com/SpDDoggy/DEMStudio/releases/download/v0.3.0/DEMStudio-0.3.0-sampling-terrain-light-guide.zip) · [SHA256 校验文件](https://github.com/SpDDoggy/DEMStudio/releases/download/v0.3.0/SHA256SUMS.txt)。
+[SHA256 校验文件](https://github.com/SpDDoggy/DEMStudio/releases/download/v0.3.0/SHA256SUMS.txt)。
 
 **环境要求**
 
