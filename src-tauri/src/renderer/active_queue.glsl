@@ -3,8 +3,8 @@ layout(local_size_x=256) in;
 // DrawArraysIndirectCommand followed by compact pixel indices.
 layout(std430,binding=1) buffer ActiveQueue { uint words[]; };
 layout(std430,binding=2) readonly buffer RayBatchControl { uint aq_batch_words[]; };
-uniform sampler2DArray aq_state;
-uniform sampler2D aq_pages;
+layout(binding=6) uniform sampler2DArray aq_state;
+layout(binding=9) uniform sampler2D aq_pages;
 uniform ivec2 aq_extent;
 uniform int aq_across, aq_resume, aq_query_memo, aq_reset_query, aq_mode;
 uniform int aq_batch_mode, aq_expected_sample;

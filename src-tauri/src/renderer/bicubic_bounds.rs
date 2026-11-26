@@ -24,5 +24,3 @@ pub(super) fn level_values(level:&MipLevel,origin:[i32;2],size:[u32;2],offset:u3
     }}
     result
 }
-
-

@@ -143,5 +143,3 @@ impl BicubicProfile {
         gl.bind_buffer_base(glow::SHADER_STORAGE_BUFFER,3,None);gl.delete_buffer(self.buffer);
     }
 }
-
-

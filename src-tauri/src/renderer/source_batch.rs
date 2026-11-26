@@ -7,7 +7,10 @@ fn sample_draw_activity(draw:u64)->bool {
 }
 impl GlRenderer {
     pub unsafe fn render_source_batch(&mut self,e:&mut PagedExport,cancel:&AtomicBool,remaining:u32)->Result<u32,String>{
-        if self.count==0||e.batch.is_none()||self.geo_tile.is_none() {
+        if e.compute_image_mode.is_some()&&e.active_queue.is_some(){
+            return Err("ComputeImageLayout执行路径不能包含批次POINTS稀疏提交".into());
+        }
+        if self.export_layer!=0||self.count==0||e.batch.is_none()||self.geo_tile.is_none() {
             self.render_source_sample(e,cancel)?;return Ok(1);
         }
         if std::env::var("DEMSTUDIO_SAMPLE_WAVEFRONT").as_deref()==Ok("4"){return self.render_source_wavefront(e,cancel,remaining);}
@@ -60,6 +63,7 @@ impl GlRenderer {
                         self.gl.bind_image_texture(0,Some(e.state[0]),0,true,0,glow::READ_WRITE,glow::RGBA32F);
                         self.gl.draw_arrays(glow::TRIANGLES,0,3);e.stats.draws+=1;
                         self.gl.memory_barrier(glow::SHADER_IMAGE_ACCESS_BARRIER_BIT|glow::TEXTURE_FETCH_BARRIER_BIT);
+
                     }
                     for step in 0..e.batch_steps {
                         if let Some(paths)=e.phase_paths {
@@ -85,6 +89,7 @@ impl GlRenderer {
                                     }
                                 }
                                 self.gl.memory_barrier(glow::SHADER_IMAGE_ACCESS_BARRIER_BIT|glow::TEXTURE_FETCH_BARRIER_BIT);
+
                                 e.phase_rounds+=1;
                             }
                             continue;
@@ -109,7 +114,8 @@ impl GlRenderer {
                         }
                         else if activity&&step>0 {e.active_queue.as_ref().unwrap().draw(&self.gl,e.path,e.size)?;}
                         else {self.draw_source_image(e)?;}
-                        self.gl.memory_barrier(glow::SHADER_IMAGE_ACCESS_BARRIER_BIT|glow::TEXTURE_FETCH_BARRIER_BIT);e.stats.draws+=1;
+                        self.gl.memory_barrier(glow::SHADER_IMAGE_ACCESS_BARRIER_BIT|glow::TEXTURE_FETCH_BARRIER_BIT);
+        e.stats.draws+=1;
                         e.timers.end(&self.gl,GpuStage::BatchIntegrate,integration_timer);
                     }
                     let reduction_timer=e.timers.begin(&self.gl,GpuStage::BatchReduction);

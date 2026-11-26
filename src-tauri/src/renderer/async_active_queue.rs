@@ -139,4 +139,3 @@ impl StCapture{
     }
     unsafe fn destroy(self,gl:&glow::Context){gl.delete_framebuffer(self.fbo);gl.delete_texture(self.texture);gl.delete_program(self.program);}
 }
-

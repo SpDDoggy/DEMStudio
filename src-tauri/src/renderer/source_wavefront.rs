@@ -98,4 +98,3 @@ impl GlRenderer {
         e.path=original;self.restore_sample_rng(table.after_rng);self.gl.disable(glow::BLEND);self.gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);result
     }
 }
-

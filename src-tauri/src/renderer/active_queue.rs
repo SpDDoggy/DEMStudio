@@ -62,9 +62,10 @@ impl ActiveQueue {
         gl.bind_buffer_base(glow::SHADER_STORAGE_BUFFER,1,Some(self.buffer));
         let set=|name:&str,value:i32|gl.uniform_1_i32(gl.get_uniform_location(self.program,name).as_ref(),value);
         set("aq_batch_mode",i32::from(expected.is_some()));set("aq_expected_sample",expected.unwrap_or(0) as i32);
-        set("aq_mode",0);gl.dispatch_compute(1,1,1);gl.memory_barrier(glow::SHADER_STORAGE_BARRIER_BIT);
         gl.active_texture(glow::TEXTURE6);gl.bind_texture(glow::TEXTURE_2D_ARRAY,Some(state));set("aq_state",6);
         gl.active_texture(glow::TEXTURE9);gl.bind_texture(glow::TEXTURE_2D,Some(pages));set("aq_pages",9);
+        // Reset uses the same executable: all sampler bindings must be valid first.
+        set("aq_mode",0);gl.dispatch_compute(1,1,1);gl.memory_barrier(glow::SHADER_STORAGE_BARRIER_BIT);
         gl.uniform_2_i32(gl.get_uniform_location(self.program,"aq_extent").as_ref(),size[0] as i32,size[1] as i32);
         set("aq_across",source_width.div_ceil(512) as i32);set("aq_resume",i32::from(resume));
         set("aq_query_memo",i32::from(query_memo));set("aq_reset_query",i32::from(reset_query));set("aq_mode",1);

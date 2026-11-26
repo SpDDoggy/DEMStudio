@@ -75,7 +75,7 @@ impl GlRenderer {
                         let integration_timer=e.timers.begin(&self.gl,GpuStage::BatchIntegrate);
                         if queued&&!packed{e.async_active_queue.as_ref().unwrap().draw(&self.gl,program,size)?;}else{self.gl.draw_arrays(glow::TRIANGLES,0,3);}
                         e.stats.draws+=1;e.async_draws+=1;
-                        
+
                         #[cfg(not(test))] self.gl.memory_barrier(glow::SHADER_IMAGE_ACCESS_BARRIER_BIT|glow::SHADER_STORAGE_BARRIER_BIT|glow::TEXTURE_FETCH_BARRIER_BIT);
                         e.timers.end(&self.gl,GpuStage::BatchIntegrate,integration_timer);
                     }

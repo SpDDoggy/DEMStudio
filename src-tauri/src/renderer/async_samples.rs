@@ -148,9 +148,3 @@ impl AsyncSamples{
     }
     pub unsafe fn destroy(self,gl:&glow::Context){gl.bind_buffer_base(glow::SHADER_STORAGE_BUFFER,4,None);gl.bind_buffer_base(glow::SHADER_STORAGE_BUFFER,5,None);gl.delete_buffer(self.buffer);gl.delete_buffer(self.table);gl.delete_program(self.program);gl.delete_program(self.commit);}
 }
-
-
-
-
-
-

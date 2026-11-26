@@ -82,5 +82,3 @@ impl PagePrefetch {
     pub(super) fn try_take(&mut self,page:Page)->Option<Result<Brick,String>> {self.worker.try_take(page)}
     pub(super) fn drain(&mut self)->Vec<(Page,Result<Brick,String>)> {self.worker.drain()}
 }
-
-

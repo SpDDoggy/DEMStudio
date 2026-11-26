@@ -10,6 +10,12 @@ void main(){
     }
     for(int layer=0;layer<RS_MUTABLE_LAYERS;++layer)
         pg_s[layer]=resume?imageLoad(rs_state_image,ivec3(coord,layer)):vec4(0.);
+    // Primary hit layers are immutable and omitted from mutable state traffic.
+    // Fog needs them after any continuation, including specialized phase jobs.
+    if(resume&&scene_fog_density>0.){
+        pg_s[17]=imageLoad(rs_state_image,ivec3(coord,17));
+        pg_s[18]=imageLoad(rs_state_image,ivec3(coord,18));
+    }
     pg_s[5]=vec4(-1.,0.,0.,0.);rs_run();
 #ifdef RS_DONE_MINIMAL_STORE
     // Completed paths are never resumed. Consumers need only completion and

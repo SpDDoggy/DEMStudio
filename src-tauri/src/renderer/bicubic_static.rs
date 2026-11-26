@@ -49,6 +49,3 @@ fn expand_fixed(source:&str)->String {
     }
     out.push_str(rest);out
 }
-
-
-

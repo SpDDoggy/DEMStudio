@@ -1,0 +1,8 @@
+:root,:root[data-ui-contrast=dark]{color-scheme:dark;--text:#edf2f5;--strong:#edf2f5;--muted:#c4cfdb;--accent:#91b7ee;--edge:rgba(196,217,250,.16);--glass-alpha:.65;--popup-alpha:.82;--glass:rgba(20,31,48,var(--glass-alpha));--popup-bg:rgba(20,31,48,var(--popup-alpha));--control-bg:rgba(8,17,30,.24)}
+.glass{background:var(--glass);border-color:var(--edge);transition:background-color .28s ease,border-color .28s ease}
+summary,.brand,.panelfoot b{color:var(--strong)}
+.ramp-sampling summary,.ramp-workbench-distribution,.ramp-position-tail,.ramp-unit{color:var(--muted)}
+dialog,#export-dialog{background:var(--popup-bg)}
+.combo-trigger,.combo-menu{color:var(--text);background:var(--control-bg)}
+.combo-menu{background:rgba(20,31,48,.93)}
+@media(prefers-reduced-motion:reduce){.glass{transition:none}}

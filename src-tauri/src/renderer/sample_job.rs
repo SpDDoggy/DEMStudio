@@ -52,5 +52,3 @@ impl SampleJob {
         *self = Self::default();
     }
 }
-
-

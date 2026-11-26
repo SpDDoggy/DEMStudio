@@ -1,0 +1,12 @@
+.color-picker-popup{position:fixed;z-index:1400;box-sizing:border-box;width:252px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);overflow:auto;padding:16px;border:1px solid #c4d9fa20;border-radius:16px;background:var(--popup-bg,rgba(20,31,48,.84));color:var(--text,#edf3fc);box-shadow:0 8px 32px #07122238,inset 0 1px #ffffff08;display:grid;grid-template-columns:1fr;gap:12px;color-scheme:dark;animation:color-picker-in .16s ease-out}
+.color-picker-sv{position:relative;height:156px;border-radius:7px;touch-action:none;background-image:linear-gradient(to top,#000,transparent),linear-gradient(to right,#fff,transparent);cursor:crosshair}
+.color-picker-cursor{position:absolute;width:10px;height:10px;border:2px solid white;box-shadow:0 0 2px #000;border-radius:50%;transform:translate(-50%,-50%);pointer-events:none}
+.color-picker-popup .color-picker-hue{appearance:none;width:100%;height:13px;min-height:13px;padding:0;border:0;border-radius:6px;background:linear-gradient(to right,#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00)}
+.color-picker-hue::-webkit-slider-thumb{appearance:none;width:15px;height:15px;border:2px solid white;border-radius:50%;background:transparent;box-shadow:0 0 2px #000}
+.color-picker-preview{height:22px;border:1px solid #ffffff40;border-radius:5px}
+.color-picker-rgb{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.color-picker-rgb label{display:grid;gap:4px;text-align:center;font-size:11px;color:#d7e3f4}
+.color-picker-popup input:not([type=range]){box-sizing:border-box;width:100%;min-width:0;max-width:none;min-height:29px;padding:4px 6px;border:0;border-bottom:1px solid #a9c4e32b;border-radius:4px;background:#09142324;color:#f5f8ff;text-align:center;font:inherit;font-size:12px;transition:background .15s,border-color .15s}
+.color-picker-popup input:not([type=range]):focus{background:#09142355;border-bottom-color:var(--accent)}
+@keyframes color-picker-in{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
+@media(prefers-reduced-motion:reduce){.color-picker-popup{animation:none}}
+.color-picker-hex{display:grid;grid-template-columns:38px 1fr;align-items:center;font-size:11px}.color-picker-popup input:invalid{border-color:#f89c9c}.color-picker-popup :focus-visible{outline:2px solid #99c5ff;outline-offset:2px}

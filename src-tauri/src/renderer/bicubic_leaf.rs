@@ -33,6 +33,3 @@ pub(super) unsafe fn build(gl:&glow::Context,program:glow::Program,raw:glow::Tex
     gl.bind_texture(glow::TEXTURE_2D_ARRAY,texture);gl.active_texture(active);gl.use_program(previous);
     let error=gl.get_error();if error!=glow::NO_ERROR{return Err(format!("Bicubic叶界计算失败 GL {error:#x}"));}Ok(())
 }
-
-
-

@@ -428,5 +428,3 @@ fn image_rows(path:&Path,expected:[u32;2],mut emit:impl FnMut(u32,u32,&[f64])->R
     }
     Ok(())
 }
-
-

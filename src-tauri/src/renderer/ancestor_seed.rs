@@ -9,7 +9,7 @@ impl AncestorSeed{
  pub unsafe fn create(gl:&glow::Context,slots:u32,padded:u32)->Result<Self,String>{
   Self::create_with_source(gl,slots,padded,&compute_source()?)
  }
- 
+
  unsafe fn create_with_source(gl:&glow::Context,slots:u32,padded:u32,source:&str)->Result<Self,String>{
   if slots==0||padded<32||!padded.is_power_of_two(){return Err("ancestor seed allocation invalid".into());}
   let program=link(gl,&[(glow::COMPUTE_SHADER,source)])?;
@@ -30,6 +30,3 @@ impl AncestorSeed{
  pub fn memory_bytes(&self)->u64{u64::from(self.slots)*SLOT_BYTES}
  pub unsafe fn destroy(self,gl:&glow::Context){gl.delete_texture(self.texture);gl.delete_program(self.program);}
 }
-
-
-

@@ -88,5 +88,3 @@ impl Thumbnail {
         Ok((self.pixels, self.size[0], self.size[1]))
     }
 }
-
-

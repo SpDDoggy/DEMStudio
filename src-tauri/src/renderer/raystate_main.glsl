@@ -13,10 +13,16 @@
 uniform int rs_state_bank;
 const int RS_WORLD=1,RS_SURFACE=2,RS_SHADOW=3,RS_SCATTER=4;
 const int RS_MATTE_SUN=5,RS_MATTE_SKY=6,RS_DONE=7;
-void rs_finish(vec3 Lo,float alpha){pg_s[6]=max(vec4(Lo*alpha,alpha),0.);pg_s[7].w=float(RS_DONE);pg_s[5]=vec4(-1.,4.,0.,0.);}
+void rs_finish(vec3 Lo,float alpha){if(is_solid(pg_s[18].y)&&!is_ground(pg_s[18].y))Lo=scene_apply_fog(Lo,pg_s[17].x,pg_s[18].z,pg_s[18].w);vec4 result=vec4(Lo*alpha,alpha);
+if(scene_background_transition!=0&&scene_background_physical_weight>0.&&scene_background_physical_weight<1.&&is_ground(pg_s[18].y)){
+    init_rand();gen_light_samples();vec3 primary_o,primary_dir,primary_A;sample_ray(output_st(st),primary_o,primary_dir,primary_A);
+    result=scene_transition_ground(result,primary_o+primary_dir*pg_s[17].x);
+}
+pg_s[6]=max(result,0.);pg_s[7].w=float(RS_DONE);pg_s[5]=vec4(-1.,4.,0.,0.);}
 void rs_clear_query(){pg_s[2].w=0.;pg_s[5]=vec4(-1.,0.,0.,0.);}
 bool rs_visibility(vec3 o,vec3 dir,float d,out float att){
     if(d>0.)d=max(d-MIN,0.);att=1.;
+    if(scene_ground_shadow==0&&int(pg_s[7].w)==RS_SHADOW&&is_ground(pg_s[4].y))return true;
 #ifdef OPT_GROUND
     att=ray_vs_ground_shadow(o,dir,vec2(OFFSET,d));
 #endif
@@ -43,6 +49,16 @@ bool rs_terminal_visibility(vec3 o,vec3 dir,out float att){
     return true;
 }
 #endif
+#ifdef RS_MATTE
+void rs_begin_ground_matte(vec3 ground,int phase){
+    pg_s[7]=vec4(ground,float(phase));
+    vec3 skyDir=sample_hemi_cos(jitter2(lobes[0]));
+    vec3 sun=max(LIGHT0.L,vec3(0.))*max(LIGHT0.o.z,0.)/PI;
+    vec3 sky=max(scene_sky(skyDir),vec3(0.));vec3 weights=vec3(.2126,.7152,.0722);
+    pg_s[15]=vec4(skyDir,0.);pg_s[16]=vec4(dot(sun,weights),dot(sky,weights),dot(sky_mean_radiance+sun_mean_radiance,weights),0.);
+    pg_s[10].w=jitter_rand;
+}
+#endif
 void rs_run(){
     // Recreate this sample's immutable LIGHT0 without consuming the saved RNG.
     init_rand();gen_light_samples();
@@ -51,16 +67,11 @@ void rs_run(){
         vec3 o,dir,A;sample_ray(output_st(st),o,dir,A);
         pg_s[7]=vec4(o,float(RS_WORLD));pg_s[8]=vec4(dir,0.);
         pg_s[9]=vec4(A,0.);pg_s[10]=vec4(0.,0.,0.,jitter_rand);
-        pg_s[11]=vec4(0.);pg_s[12]=vec4(0.);pg_s[14]=vec4(0.,1.,0.,1.);
+        pg_s[11]=vec4(0.);pg_s[12]=vec4(0.);pg_s[17]=vec4(0.);pg_s[18]=vec4(0.);pg_s[14]=vec4(0.,1.,0.,1.);
         rs_clear_query();
-#ifdef RS_MATTE
+#if defined(RS_MATTE) && defined(RS_GEO)
         if(surface_pass==0&&geo_shadow_catcher!=0&&(any(lessThan(o.xy,vec2(.5)))||any(greaterThanEqual(o.xy,geo_source_size+vec2(.5))))){
-            o.z=.002;pg_s[7]=vec4(o,float(RS_MATTE_SUN));
-            vec3 skyDir=sample_hemi_cos(jitter2(lobes[0]));
-            vec3 sun=max(LIGHT0.L,vec3(0.))*max(LIGHT0.o.z,0.)/PI;
-            vec3 sky=max(scene_sky(skyDir),vec3(0.));vec3 weights=vec3(.2126,.7152,.0722);
-            pg_s[15]=vec4(skyDir,0.);pg_s[16]=vec4(dot(sun,weights),dot(sky,weights),dot(sky_mean_radiance+sun_mean_radiance,weights),0.);
-            pg_s[10].w=jitter_rand;
+            o.z=.002;rs_begin_ground_matte(o,RS_MATTE_SUN);
         }
 #endif
     }
@@ -84,7 +95,8 @@ void rs_run(){
             }
 #endif
             float d=INF;vec3 n=vec3(0.);vec2 id;float att;
-            if(pg_primary_cached!=0&&bounce==0){IW_COUNT(7);vec4 hit=pg_memo(pg_memo_a,0);d=hit.x;n=hit.yzw;id=pg_memo(pg_memo_b,0).xy;}
+            if(scene_ground_shadow==0&&bounce>0&&is_ground(pg_s[4].y)){id=vec2(ID_AIR);}
+            else if(pg_primary_cached!=0&&bounce==0){IW_COUNT(7);vec4 hit=pg_memo(pg_memo_a,0);d=hit.x;n=hit.yzw;id=pg_memo(pg_memo_b,0).xy;}
             else{
                 if(!pg_walk(o,dir,vec2(OFFSET,d),false,d,n,id,att))break;
 #ifdef OPT_GROUND
@@ -92,13 +104,21 @@ void rs_run(){
 #endif
             }
             pg_s[3]=vec4(d,n);pg_s[4]=vec4(id,1.,1.);
-            if(bounce==0){pg_s[17]=pg_s[3];pg_s[18]=pg_s[4];}
+            if(bounce==0){pg_s[17]=pg_s[3];pg_s[18]=vec4(pg_s[4].xy,o.z,dir.z);}
             rs_clear_query();
             pg_s[7].w=float(RS_SURFACE);continue;
         }
         if(phase==RS_SURFACE){
             IW_COUNT(2);
             float d=pg_s[3].x;vec3 n=pg_s[3].yzw;vec2 id=pg_s[4].xy;
+            if(surface_pass>=2){
+                if(!is_map(id.y)||is_n_zero(n)){pg_s[6]=vec4(0.);pg_s[7].w=float(RS_DONE);pg_s[5]=vec4(-1.,4.,0.,0.);return;}
+                if(surface_pass==4){
+                    pg_s[7]=vec4(o+dir*d,float(RS_SHADOW));pg_s[13]=vec4(LIGHT0.o.xyz,INF);continue;
+                }
+                vec3 value=surface_pass==2?normalize(n)*.5+.5:vec3(clamp((export_depth_range.y-d)/max(export_depth_range.y-export_depth_range.x,1e-12),0.,1.));
+                pg_s[6]=vec4(value,1.);pg_s[7].w=float(RS_DONE);pg_s[5]=vec4(-1.,4.,0.,0.);return;
+            }
             if(surface_pass!=0){
                 if(is_map(id.y)&&!is_n_zero(n)){
                     float t=source_height((o.z+dir.z*d-appearance_height.x)/max(appearance_height.y,1e-12));
@@ -106,6 +126,16 @@ void rs_run(){
                     pg_s[6]=vec4(clamp(t,0.,1.),1.,tex_st);
                 }else pg_s[6]=vec4(0.);
                 pg_s[7].w=float(RS_DONE);pg_s[5]=vec4(-1.,4.,0.,0.);return;
+            }
+#ifdef LAYOUT_SHADOW_ONLY
+            if(bounce==0&&is_ground(id.y)&&scene_layout_shadow_only!=0&&scene_background_transparent!=0){
+                if(scene_ground_shadow==0){rs_finish(vec3(0.),0.);return;}
+                vec3 ground=o+dir*d;ground.z+=.002;
+                rs_begin_ground_matte(ground,RS_MATTE_SUN);pg_s[5]=vec4(-1.,2.,0.,0.);continue;
+            }
+#endif
+            if(bounce==0&&is_empty(max(id.x,id.y))&&scene_background_override()){
+                vec4 bg=scene_visible_background();rs_finish(bg.rgb,bg.a);return;
             }
             path_alpha=1.;pg_s[9].w=path_alpha;
             if(is_empty(max(id.x,id.y))){
@@ -128,6 +158,10 @@ void rs_run(){
             pg_s[11]=vec4(n,float(bounce));pg_s[12]=vec4(K,float(num_diffuse));
             vec3 wo=LIGHT0.o.xyz-o*LIGHT0.o.w;float wd=norm(wo);pg_s[13]=vec4(wo,mix(INF,wd,LIGHT0.o.w));
             pg_s[5]=vec4(-1.,2.,0.,0.);continue;
+        }
+        if(phase==RS_SHADOW&&surface_pass==4){
+            float att;if(!rs_visibility(o,pg_s[13].xyz,pg_s[13].w,att))break;
+            pg_s[6]=vec4(vec3(att),1.);pg_s[7].w=float(RS_DONE);pg_s[5]=vec4(-1.,4.,0.,0.);return;
         }
         if(phase==RS_SHADOW){
             IW_COUNT(3);

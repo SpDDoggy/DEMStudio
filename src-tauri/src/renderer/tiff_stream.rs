@@ -202,11 +202,15 @@ impl ChunkReader {
         let mut row_y = 0u32;
         let mut seen = 0u64;
         let expected = row_size as u64 * u64::from(rows);
+        // Some writers encode the bottom strip with its full RowsPerStrip
+        // height. Match the TIFF decoder's vertical-padding compatibility,
+        // without allowing arbitrary extra samples or allocating a whole strip.
+        let padded = row_size as u64 * u64::from(l.ch);
         let mut sink = |data: &[u8]| -> Result<(), String> {
             seen = seen
                 .checked_add(data.len() as u64)
                 .ok_or("TIFF 解码字节数溢出")?;
-            if seen > expected {
+            if seen > padded {
                 return Err("TIFF 解码数据超过分块声明尺寸".into());
             }
             let mut data = data;
@@ -231,7 +235,7 @@ impl ChunkReader {
             .map_err(|e| e.to_string())?;
         let mut source = d.inner().take(l.counts[index]);
         decode_chunk(&mut source, l.compression, &mut sink)?;
-        if seen != expected || filled != 0 {
+        if (seen != expected && seen != padded) || filled != 0 {
             return Err(format!(
                 "TIFF 分块数据不完整：需要 {expected} 字节，实际 {seen} 字节"
             ));
@@ -392,5 +396,3 @@ fn decode_lzw(
         }
     }
 }
-
-

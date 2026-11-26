@@ -29,7 +29,7 @@ pub(super) fn inject_header(shader:&mut String)->Result<(),String>{
     shader.insert_str(at,SHADER_HEADER);
     if clock_enabled(){inject_clock(shader)?;}
     if capture_enabled(){let at=shader.find("#ifdef WP_PROFILE").ok_or("查询捕获缺少遍历入口")?;shader.insert_str(at,CAPTURE_SHADER);}
-    
+
     if work_enabled(){let at=shader.find("#ifdef WP_PROFILE").ok_or("积分计数缺少遍历入口")?;let header=WORK_SHADER.replace("IW_BASE",&(work_offset(capture_enabled())/4).to_string());shader.insert_str(at,&header);}
     Ok(())
 }
@@ -143,6 +143,3 @@ fn decode_work(bytes:&[u8])->serde_json::Value{
     let mut result=serde_json::json!({"enabled":true,"valid":true,"sampling_probability":1./256.,"scope":"async image Fragment invocations after preserved sample zero; stable global pixel hash, raw sampled totals, not extrapolated; phase entries include retries/yields; commit counter covers fused path only","additional_buffer_bytes":WORK_BYTES});
     for(i,name)in WORK_FIELDS.iter().enumerate(){result[*name]=serde_json::json!(u64::from_ne_bytes(bytes[i*8..i*8+8].try_into().unwrap()));}result
 }
-
-
-

@@ -1,16 +1,41 @@
+mod mesh_export;
+mod mesh_appearance;
+mod mesh_source;
+mod bilinear_shadow_precision;
+mod bilinear_refine;
+mod smooth_bilinear;
 pub mod appearance;
+mod appearance_distribution;
+pub use appearance_distribution::AppearanceDistribution;
+mod appearance_settings;
+mod background;
+mod water;
+pub(crate) use water::validate as validate_water_parameters;
+mod fog;
+pub(crate) use fog::validate as validate_fog_parameters;
+mod cloud;
+
+
+pub(crate) use cloud::validate as validate_cloud_parameters;
+mod ramp;
+pub(crate) use appearance_settings::validate as validate_appearance_parameters;
 pub mod export_extent;
+mod export_layers;
 pub mod georef;
 pub mod geotiff;
 pub mod gl_renderer;
 pub mod heightmap;
 pub mod native;
+#[cfg(target_os = "windows")]
+mod resize_snapshot;
 pub mod png_output;
+pub mod image_output;
 pub mod raster;
 mod sky;
 mod tiff_stream;
 mod source_grid;
 mod paged_source;
+mod source_export_policy;
 mod paged_shader;
 mod raystate_shader;
 mod compact_feedback;
@@ -19,6 +44,25 @@ mod phase_queue;
 mod wavefront_queue;
 mod async_samples;
 mod async_active_queue;
+mod compute_image_layout;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 mod sample_wavefront;
 mod wavefront_runtime;
 mod sample_wavefront_shader;
@@ -48,6 +92,12 @@ pub mod thumbnail;
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct CloudSeedWeight {
+    pub seed: u32,
+    pub weight: f32,
+}
+
 #[derive(Clone, Debug)]
 pub struct HeightMap {
     pub width: u32,
@@ -75,6 +125,46 @@ pub fn initial_height_scale(map: &HeightMap) -> Option<f32> {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct RenderParams {
+    pub appearance_layers_version: u8,
+    pub material_enabled: bool,
+    pub elevation_enabled: bool,
+    pub texture_enabled: bool,
+    pub transition_background_from: Option<background::BackgroundState>,
+    pub transition_background_mix: f32,
+    pub background_mode: String,
+    pub background_color: String,
+    pub background_color2: String,
+    pub background_angle: f32,
+    pub background_follow_light: bool,
+    pub sky_follow_light: bool,
+    pub transition_sky_follow: Option<f32>,
+    pub transition_sky_model: Option<f32>,
+    pub ground_enabled: bool,
+    pub ground_color: String,
+    pub ground_shadow: bool,
+    pub export_transparent: bool,
+    pub layout_shadow_only: bool,
+    pub export_normal: bool,
+    pub export_depth: bool,
+    pub export_shadow_layer: bool,
+    pub texture_mapping: String,
+    pub texture_fit: String,
+    pub texture_scale: f32,
+    pub texture_offset_x: f32,
+    pub texture_offset_y: f32,
+    pub texture_rotation: f32,
+    pub texture_blend: String,
+    pub material_roughness: f32,
+    pub material_specular: f32,
+    pub material_specular_color: String,
+    pub ramp_stops: Vec<RampStop>,
+    pub ramp_offset: f32,
+    pub ramp_reverse: bool,
+    pub ramp_wrap: bool,
+    pub ramp_range_mode: String,
+    pub ramp_min: f64,
+    pub ramp_max: f64,
+    pub appearance_pick: bool,
     pub sun_altitude: f32,
     pub sun_azimuth: f32,
     pub sun_size: f32,
@@ -85,12 +175,41 @@ pub struct RenderParams {
     pub sky_model: String,
     pub max_bounces: u32,
     pub experimental_bounces: bool,
+    pub water_enabled: bool,
+    pub water_level: f32,
+    pub water_opacity: f32,
+    pub water_color: String,
+    pub water_roughness: f32,
+    pub fog_enabled: bool,
     pub fog_density: f32,
+    pub fog_color: String,
+    pub fog_start: f32,
+    pub fog_end: f32,
+    pub fog_height_enabled: bool,
+    pub fog_height_base: f32,
+    pub fog_height_falloff: f32,
+    pub cloud_enabled: bool,
+    pub cloud_shadow_enabled: bool,
+    pub cloud_shadow_strength: f32,
+    pub cloud_coverage: f32,
+    pub cloud_density: f32,
+    pub cloud_height: f32,
+    pub cloud_thickness: f32,
+    pub cloud_scale: f32,
+    pub cloud_range: f32,
+    pub cloud_offset_x: f32,
+    pub cloud_offset_y: f32,
+    pub cloud_seed: u32,
+    pub transition_cloud_seeds: Vec<CloudSeedWeight>,
+    pub cloud_color: String,
     pub camera_yaw: f32,
     pub camera_pitch: f32,
     pub camera_distance: f32,
     /// World-space target offset normalized by the map's longest side.
     pub camera_pan: [f32; 3],
+    /// Film-plane offset in shortest-side half-frame units, before FOV scaling.
+    pub camera_frame_x: f32,
+    pub camera_frame_y: f32,
     pub field_of_view: f32,
     pub exposure: f32,
     pub gamma: f32,
@@ -158,6 +277,46 @@ pub struct RenderParams {
 impl Default for RenderParams {
     fn default() -> Self {
         Self {
+            appearance_layers_version: 0,
+            material_enabled: true,
+            elevation_enabled: false,
+            texture_enabled: false,
+            transition_background_from: None,
+            transition_background_mix: 1.,
+            background_mode: "sky".into(),
+            background_color: "#30343b".into(),
+            background_color2: "#647180".into(),
+            background_angle: 90.,
+            background_follow_light: false,
+            sky_follow_light: false,
+            transition_sky_follow: None,
+            transition_sky_model: None,
+            ground_enabled: true,
+            ground_color: "#767676".into(),
+            ground_shadow: true,
+            export_transparent: false,
+            layout_shadow_only: false,
+            export_normal: false,
+            export_depth: false,
+            export_shadow_layer: false,
+            texture_mapping: "aligned".into(),
+            texture_fit: "fill".into(),
+            texture_scale: 1.,
+            texture_offset_x: 0.,
+            texture_offset_y: 0.,
+            texture_rotation: 0.,
+            texture_blend: "overlay".into(),
+            material_roughness: 0.5,
+            material_specular: 0.,
+            material_specular_color: "#ffffff".into(),
+            ramp_stops: Vec::new(),
+            ramp_offset: 0.,
+            ramp_reverse: false,
+            ramp_wrap: false,
+            ramp_range_mode: "source".into(),
+            ramp_min: 0.,
+            ramp_max: 1.,
+            appearance_pick: false,
             sun_altitude: 45.,
             sun_azimuth: 135.,
             sun_size: 1.,
@@ -168,11 +327,39 @@ impl Default for RenderParams {
             sky_model: "atmosphere".into(),
             max_bounces: 8,
             experimental_bounces: false,
-            fog_density: 0.,
+            water_enabled: false,
+            water_level: 20.,
+            water_opacity: 80.,
+            water_color: "#4c9fa6".into(),
+            water_roughness: 0.2,
+            fog_enabled: false,
+            fog_density: 20.,
+            fog_color: "#c8d6df".into(),
+            fog_start: 0.,
+            fog_end: 10000.,
+            fog_height_enabled: false,
+            fog_height_base: 0.,
+            fog_height_falloff: 20.,
+            cloud_enabled: false,
+            cloud_shadow_enabled: false,
+            cloud_shadow_strength: 50.,
+            cloud_coverage: 35.,
+            cloud_density: 60.,
+            cloud_height: 15.,
+            cloud_thickness: 12.,
+            cloud_scale: 25.,
+            cloud_range: 125.,
+            cloud_offset_x: 0.,
+            cloud_offset_y: 0.,
+            cloud_seed: 7,
+            transition_cloud_seeds: Vec::new(),
+            cloud_color: "#f3f1e8".into(),
             camera_yaw: 45.,
             camera_pitch: 35.,
             camera_distance: 10.,
             camera_pan: [0.; 3],
+            camera_frame_x: 0.,
+            camera_frame_y: 0.,
             field_of_view: 45.,
             exposure: 1.,
             gamma: 2.2,
@@ -238,6 +425,22 @@ impl Default for RenderParams {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RampStop {
+    pub position: f32,
+    pub color: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppearanceSample {
+    pub height: f64,
+    pub normalized_height: f32,
+    pub uv: [f32;2],
+    pub range: [f64;2],
+}
+
 #[derive(Clone, Deserialize, Debug)]
 pub struct OverlayRect {
     pub x: i32,
@@ -261,9 +464,11 @@ pub struct ViewportRect {
 #[derive(Clone, Serialize, Default, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct RenderStatus {
+    pub appearance_range: Option<[f64;2]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub initial_height_scale: Option<f32>,
     pub ready: bool,
+    pub frame_presented: bool,
     pub paused: bool,
     pub samples: u32,
     pub target_samples: u32,
@@ -291,9 +496,3 @@ pub struct RenderStatus {
 mod page_scheduler;
 
 mod page_prefetch;
-
-
-
-
-
-

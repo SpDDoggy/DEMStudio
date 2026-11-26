@@ -64,4 +64,3 @@ pub(super) unsafe fn bind(gl:&glow::Context,program:glow::Program,texture:glow::
     gl.uniform_2_i32(gl.get_uniform_location(program,"vp_size").as_ref(),p.size[0]as i32,p.size[1]as i32);
     for(name,v)in[("vp_height",[p.height_scale,p.height_offset,p.quant_step]),("vp_volume_min",p.volume_min),("vp_volume_max",p.volume_max)]{gl.uniform_3_f32(gl.get_uniform_location(program,name).as_ref(),v[0],v[1],v[2]);}
 }
-

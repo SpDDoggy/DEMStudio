@@ -11,7 +11,7 @@
 
 ![DEMStudio 工作区](https://raw.githubusercontent.com/SpDDoggy/DEMStudio/92e6cff89cfe862cc178805eafde74578e0d5e04/assets/readme/hero.png)
 
-`Windows` · `Rust` · `Tauri 2` · `OpenGL` · `GLSL` · `v0.2.0`
+`Windows` · `Rust` · `Tauri 2` · `OpenGL` · `GLSL` · `v0.3.0`
 
 </div>
 
@@ -49,16 +49,26 @@ DEMStudio 将高度场渲染与地图制作连接起来：既可以独立制作�
 
 
 
+## 0.3.0 更新
+
+- 双线性正射影像导出启用 Compute 加速，双三次保留细腻的 B 样条表面与平滑法线。
+- 材质、赋色与贴图可独立组合；色带支持分位数分级、动态色标与配色库。
+- 新增云、云影、水面、雾、背景控制与场景预设，支持命名视图及过渡。
+- 新增视频、PLY / OBJ 模型导出，以及法线、深度与太阳阴影独立图层。
+- 支持多实例 MCP 自动化，改进 DEM 加载、窗口缩放和大栅格导出。
+
 ## 获取与运行
 
-下载 [DEMStudio 0.2.0](https://github.com/SpDDoggy/DEMStudio/releases/tag/v0.2.0)：提供 Windows x64 单文件 EXE，下载后直接运行（需系统已有 WebView2 Runtime）。也可从下列完整源码构建。
+下载 [DEMStudio 0.3.0](https://github.com/SpDDoggy/DEMStudio/releases/tag/v0.3.0)：提供 [Windows x64 单文件 EXE](https://github.com/SpDDoggy/DEMStudio/releases/download/v0.3.0/DEMStudio-0.3.0-windows-x64.exe)，下载后直接运行（需系统已有 WebView2 Runtime）。也可从下列完整源码构建。
+
+配套资料：[反弹次数选参技巧](https://github.com/SpDDoggy/DEMStudio/releases/download/v0.3.0/DEMStudio-0.3.0-bounce-guide.zip) · [采样、地形与光照技巧](https://github.com/SpDDoggy/DEMStudio/releases/download/v0.3.0/DEMStudio-0.3.0-sampling-terrain-light-guide.zip) · [SHA256 校验文件](https://github.com/SpDDoggy/DEMStudio/releases/download/v0.3.0/SHA256SUMS.txt)。
 
 **环境要求**
 
 - Rust 与 MSVC 工具链
 - Visual Studio C++ Build Tools
 - Microsoft Edge WebView2 Runtime
-- 支持 OpenGL 3.3 Compatibility Profile 的显卡及驱动
+- 支持 OpenGL 4.3 Compatibility Profile 的显卡及驱动
 
 ```powershell
 git clone https://github.com/SpDDoggy/DEMStudio.git
@@ -109,9 +119,9 @@ DEMStudio/
 
 ## 当前状态
 
-**v0.2.0**
+**v0.3.0**
 
-支持地形导入、交互渲染、源精度分页导出及带地理参考的 PNG / TIFF 输出。仓库包含 Rust / OpenGL 渲染核心、GLSL、栅格读取和文件输出的完整构建依赖。
+支持地形导入、交互渲染、外观与场景预设、视频和模型导出、源精度分页导出及带地理参考的 PNG / TIFF 输出。仓库包含 Rust / OpenGL 渲染核心、GLSL、栅格读取和文件输出的完整构建依赖。
 
 ---
 

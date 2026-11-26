@@ -1,4 +1,5 @@
 float pg_shadow(vec3 o,vec3 dir,float d){
+    if(scene_ground_shadow==0&&is_ground(path_id.y))return 1.;
     if(pg_yield)return 1.;
     int query=pg_ordinal++;
     if(query<pg_query_index)return pg_memo(pg_memo_b,query).z;

@@ -22,5 +22,3 @@ pub(super) unsafe fn build(gl:&glow::Context,program:glow::Program,raw:glow::Tex
  if !valid_input(core,size,padded,transform){return Err("Bicubic row input invalid".into());}
  let saved=Saved::capture(gl);configure(gl,program,raw,slot,core,size,padded,transform);gl.bind_image_texture(1,Some(output),0,false,slot as i32,glow::WRITE_ONLY,glow::RGBA32F);gl.dispatch_compute(514u32.div_ceil(8),516u32.div_ceil(8),1);gl.memory_barrier(glow::SHADER_IMAGE_ACCESS_BARRIER_BIT|glow::TEXTURE_FETCH_BARRIER_BIT);let error=gl.get_error();saved.restore(gl);if error!=glow::NO_ERROR{return Err(format!("Bicubic row build GL{error:#x}"));}Ok(())
 }
-
-

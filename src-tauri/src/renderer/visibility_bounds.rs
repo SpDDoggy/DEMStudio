@@ -77,4 +77,3 @@ impl CoarseAccumulator{
         let mut levels=vec![self.level];while levels.last().unwrap().edge>1{levels.push(parent(levels.last().unwrap())?);}Ok(levels)
     }
 }
-

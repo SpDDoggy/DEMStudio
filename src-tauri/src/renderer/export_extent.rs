@@ -48,5 +48,3 @@ impl ExportExtent {
 pub fn shadow_extent(map: &HeightMap, p: &RenderParams) -> Result<ExportExtent, String> {
     ExportExtent::for_source(map.width, map.height, p)
 }
-
-

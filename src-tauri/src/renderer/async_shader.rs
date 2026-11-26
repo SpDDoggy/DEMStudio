@@ -61,6 +61,7 @@ fn split_fused_fresh_source(source:&str)->Result<[String;2],String>{
     let dynamic="resume?imageLoad(rs_state_image,ivec3(coord,layer)):vec4(0.)";
     body=body.replace(dynamic,"vec4(0.)");
     for layer in 0..17{body=body.replace(&format!("resume?imageLoad(rs_state_image,ivec3(coord,{layer})):vec4(0.)"),"vec4(0.)");}
+    body=body.replace(FOG_PRIMARY_LOAD,"").replace(&FOG_PRIMARY_LOAD.replace("\n","\r\n"),"");
     if body.contains("imageLoad("){return Err("FreshSplit存在未识别的fresh状态载入".into());}
     fresh.truncate(main);fresh.push_str(&body);
     let mut resume=source.to_owned();resume=resume.replace(init,"as_was_initialized=as_initialized();if(!as_was_initialized){IW_FLUSH();discard;}as_begin_initialized();");
@@ -131,7 +132,7 @@ bool rs_batch_resume(){return as_was_initialized;}
     // Extensions must precede SSBO declarations; header precedes every consumer.
     let insertion=shader.lines().take_while(|l|l.starts_with("#version")||l.starts_with("#extension")).map(|l|l.len()+1).sum::<usize>();
     shader.insert_str(insertion,&header);
-    
+
     let entry=shader.rfind("void main(){").ok_or("独立采样缺少片元入口")?;
     if fused {
         // Only the image entry changes. rs_run and all primitive expressions keep
@@ -215,8 +216,8 @@ pub(super) fn source_async_phase_pair(dense:&str)->Result<[String;2],String>{
     let loop_open=phase_loop.find('{').ok_or("AsyncPair阶段括号缺失")?;
     let body=format!("{}for(int transitions=0;transitions<1;++transitions){{{}{}\n}}{}",&run[..loop_start],&phase_loop[loop_open+1..selected.0],&phase_loop[selected.0..selected.1],&run[loop_end..]);
     world.replace_range(run_range.0..run_range.1,&body);
-    let producer="if(bounce==0){imageStore(rs_state_image,ivec3(ivec2(gl_FragCoord.xy),17),pg_s[3]);imageStore(rs_state_image,ivec3(ivec2(gl_FragCoord.xy),18),pg_s[4]);}";
-    if world.matches(producer).count()!=1{return Err("AsyncPair primary producer锚点变化".into());}world=world.replace(producer,"");
+    let producer=PRIMARY_PRODUCER;
+    if world.matches(producer).count()!=1{return Err("AsyncPair primary producer锚点变化".into());}world=world.replace(producer,PRIMARY_LOCAL);
     let entry=world.rfind("void main(){").ok_or("AsyncPair WORLD缺少main")?;
     let mut main=world[entry..].to_owned();
     let waiting="bool waiting=status.y>.5&&status.y<1.5;";
@@ -260,7 +261,7 @@ pub(super) fn source_async_phase_pair(dense:&str)->Result<[String;2],String>{
 
 // Expand only the image entry's two state-copy loops. Primitive arithmetic,
 // phase budgets, and completion's minimal 5/6 stores remain untouched.
-fn expand_async_state_loops(shader:&str)->Result<String,String>{
+pub(super) fn expand_async_state_loops(shader:&str)->Result<String,String>{
     let layers=shader.lines().find_map(|line|line.trim().strip_prefix("#define RS_MUTABLE_LAYERS ")?.parse::<usize>().ok())
         .filter(|&n|n==15||n==17).ok_or("独立采样状态层定义无效")?;
     let token="for(int layer=0;layer<RS_MUTABLE_LAYERS;++layer)";
@@ -283,5 +284,3 @@ fn expand_async_state_loops(shader:&str)->Result<String,String>{
     if loads!=1||stores!=1{return Err("独立采样状态载入或写回循环缺失".into());}
     out.push_str(rest);Ok(out)
 }
-
-

@@ -59,5 +59,3 @@ fn replace_function(source: &str, signature: &str, replacement: &str) -> Result<
     }
     Err("分页函数定义括号不完整".into())
 }
-
-

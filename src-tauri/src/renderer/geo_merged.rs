@@ -53,6 +53,3 @@ impl GeoMerged{
  pub fn memory_bytes(&self)->u64{u64::from(self.slots)*LOW_BYTES+coarse_bytes(self.padded).unwrap()}
  pub unsafe fn destroy(self,gl:&glow::Context){gl.delete_texture(self.low);gl.delete_texture(self.coarse);gl.delete_program(self.program);}
 }
-
-
-

@@ -1,4 +1,8 @@
 //! Native progressive OpenGL baseline. Recovered GLSL stays immutable in research/.
+
+
+
+
 use super::{appearance::ColorTexture, HeightMap, OverlayRect, RenderParams};
 use glow::HasContext;
 use std::cell::{Cell, RefCell};
@@ -39,12 +43,14 @@ pub(super) const VERT: &str = "#version 330 compatibility\nout vec2 st; uniform 
 const COPY: &str = r#"#version 330 compatibility
 uniform sampler2D image;
 uniform vec2 output_size, output_origin, view_size;
+uniform float viewport_y;
 uniform int overlay_count;
 uniform vec4 overlay_rects[16];
 void main(){
-    vec2 uv=(gl_FragCoord.xy-output_origin)/output_size;
+    vec2 pixel=gl_FragCoord.xy-vec2(0.,viewport_y);
+    vec2 uv=(pixel-output_origin)/output_size;
     vec4 sharp=texture(image,uv);
-    vec2 point=vec2(gl_FragCoord.x,view_size.y-gl_FragCoord.y);
+    vec2 point=vec2(pixel.x,view_size.y-pixel.y);
     // The window chrome frosts our own live image, fading down from its top.
     float mask=1.-smoothstep(0.,min(180.,view_size.y*.25),point.y);
     for(int i=0;i<16;i++){
@@ -106,11 +112,34 @@ struct MapGeometry {
     span: f32,
     source_elevation: [f64; 2],
     source_size: [u32; 2],
+    numeric_height: bool,
 }
+
+fn surface_switch_cache_enabled()->bool {
+    match std::env::var("DEMSTUDIO_SURFACE_SWITCH_CACHE").as_deref() {
+        Ok("on")=>true,Ok("off")=>false,
+        _=>option_env!("DEMSTUDIO_SURFACE_SWITCH_CACHE_BUILD")==Some("on"),
+    }
+}
+struct CachedGeometry {
+    texture:glow::Texture, base:Vec<f32>, map:Option<MapGeometry>, padded:u32, levels:u32,
+    refined:bool, curve:f32, bspline:bool,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all="camelCase")]
+struct OutputIdentity {
+    output_generation:u64, content_generation:u64, params:RenderParams, samples:u32,
+    target_samples:u32, source:Option<OutputSourceIdentity>,
+}
+#[derive(Clone, serde::Serialize)]
+struct OutputSourceIdentity { name:String, width:u32, height:u32, raster:Option<super::raster::RasterSource> }
 
 pub struct GlRenderer {
     gl: glow::Context,
     path: glow::Program,
+    path_key:String,
+    cached_paths:Vec<(String,glow::Program)>,
     post: glow::Program,
     color_post: glow::Program,
     output_posts: [glow::Program; 2],
@@ -125,6 +154,8 @@ pub struct GlRenderer {
     stats_tex: glow::Texture,
     stats_fbo: glow::Framebuffer,
     lut_tex: glow::Texture,
+    export_layer: i32,
+    export_depth: [f32; 2],
     surface_ready: Cell<bool>,
     output_dirty: Cell<bool>,
     stretch_lut: RefCell<Option<Vec<u8>>>,
@@ -138,6 +169,9 @@ pub struct GlRenderer {
     // Unwarped, display-normalized texels. Curves are always rebuilt from this
     // base so toggling modes never modifies the source or compounds rounding.
     height_base: Vec<f32>,
+    cached_geometry:Option<CachedGeometry>,
+    geometry_bspline:bool,
+    original_map: Option<HeightMap>,
     paged_geometry: bool,
     paged_coarse_cache: Option<paged_gpu::CoarseCache>,
     rand_tex: glow::Texture,
@@ -145,12 +179,16 @@ pub struct GlRenderer {
     sky_tex: glow::Texture,
     sky_altitude: Option<f32>,
     sky_mean: [f32; 3],
+    sky_follow_mean: [f32;3],
     color_size: [u32; 2],
     accum: glow::Texture,
     output: glow::Texture,
     accum_fbo: glow::Framebuffer,
     output_fbo: glow::Framebuffer,
     params: RenderParams,
+    content_generation: u64,
+    output_generation: Cell<u64>,
+    output_identity: RefCell<Option<OutputIdentity>>,
     map: Option<MapGeometry>,
     geo_tile: Option<[u32; 4]>,
     geo_grid: Option<[u32; 4]>,
@@ -172,7 +210,8 @@ impl GlRenderer {
             gl.get_parameter_string(glow::VERSION),
         );
         let params = RenderParams::default();
-        let path = program(&gl, &path_source(&params, false))?;
+        let path_key=path_source(&params,false);
+        let path = program(&gl, &path_key)?;
         let post = program(&gl, &post_source(false))?;
         let color_post = program(&gl, &post_source(true))?;
         let output_posts = [
@@ -201,13 +240,16 @@ impl GlRenderer {
         let accum_fbo = gl.create_framebuffer()?;
         let output_fbo = gl.create_framebuffer()?;
         let mut s = Self {
+            content_generation: 0, output_generation: Cell::new(0), output_identity: RefCell::new(None),
             gl,
             path,
+            path_key,cached_paths:Vec::new(),
             post,
             color_post,
             output_posts, elevation_post, elevation_output_post,
             copy,
             stretch_program, surface_info, surface_fbo, filtered, filtered_fbo, stats_tex, stats_fbo, lut_tex,
+            export_layer: 0, export_depth: [0., 1.],
             surface_ready: Cell::new(false), output_dirty: Cell::new(false), stretch_lut: RefCell::new(None), stretch_count: Cell::new(0),
             stretch_export: Cell::new(false), stretch_frozen: Cell::new(false),
             vao,
@@ -215,6 +257,9 @@ impl GlRenderer {
             contour_tex,
             contour_ready: Cell::new(false),
             height_base: Vec::new(),
+            cached_geometry:None,
+            geometry_bspline:false,
+            original_map: None,
             paged_geometry: false,
             paged_coarse_cache: None,
             rand_tex,
@@ -222,6 +267,7 @@ impl GlRenderer {
             sky_tex,
             sky_altitude: None,
             sky_mean: [1.; 3],
+            sky_follow_mean: [1.;3],
             color_size: [1, 1],
             accum,
             output,
@@ -324,7 +370,11 @@ impl GlRenderer {
             rgba: vec![0, 0, 0, 0],
             name: String::new(),
         })?;
-        self.params.appearance_mode = "material".into();
+        if self.params.appearance_layers_version == 1 {
+            self.params.texture_enabled = false;
+        } else {
+            self.params.appearance_mode = "material".into();
+        }
         self.reset();
         Ok(())
     }
@@ -349,18 +399,25 @@ impl GlRenderer {
     }
 
     pub unsafe fn upload_map(&mut self, map: &HeightMap) -> Result<(), String> {
-        if map.width < 2
-            || map.height < 2
-            || map.values.len() != map.width as usize * map.height as usize
-            || map
-                .values
-                .iter()
-                .any(|v| !v.is_finite() || *v < 0. || *v > 1.)
-            || !map.span.is_finite()
-            || map.span <= 0.
-        {
-            return Err("无效的归一化高度图".into());
-        }
+        self.clear_geometry_cache();
+        self.upload_map_internal(map,false)
+    }
+    unsafe fn upload_map_internal(&mut self,map:&HeightMap,preserve_original:bool)->Result<(),String> {
+        validate_height_texture(map)?;
+        let original_source_elevation=source_elevation_range(map);
+        let original_source_size=map.source.as_ref().map(|v|[v.width,v.height]).unwrap_or([map.width,map.height]);
+        if !preserve_original {self.original_map = if super::bilinear_refine::enabled(){Some(map.clone())}else{None};}
+        let refined;
+        let map = if super::bilinear_refine::active(&self.params) {
+            let edge=map.width.max(map.height).checked_mul(2).and_then(u32::checked_next_power_of_two).ok_or("细化尺寸溢出")?;
+            if edge>self.gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) as u32{return Err("细化高度图超过 GPU 纹理尺寸上限".into());}
+            let normalized: Vec<f32> = map.values.iter().map(|v|display_sample(*v,map.display_range)).collect();
+            let curved=curved_height_texture(&normalized,effective_height_curve(&self.params));
+            let mut fine=map.clone();fine.width*=2;fine.height*=2;
+            fine.values=super::bilinear_refine::refine(&curved,map.width,map.height);
+            fine.display_range=[0.,1.];
+            refined=fine;&refined
+        } else {map};
         let size = map
             .width
             .max(map.height)
@@ -374,7 +431,7 @@ impl GlRenderer {
         self.levels = size.ilog2();
         let mut data = padded_height_texture(map, size);
         for value in &mut data {
-            *value = display_sample(*value, map.display_range);
+            if !super::bilinear_refine::active(&self.params) {*value = display_sample(*value, map.display_range);}
         }
         self.contour_ready.set(false);
         self.height_base = data;
@@ -383,15 +440,58 @@ impl GlRenderer {
             width: map.width,
             height: map.height,
             span: map.width.max(map.height) as f32 * 0.2,
-            source_elevation: source_elevation_range(map),
-            source_size:map.source.as_ref().map(|v|[v.width,v.height]).unwrap_or([map.width,map.height]),
+            source_elevation: original_source_elevation,
+            source_size:original_source_size,
+            numeric_height:numeric_height(map),
         });
         self.reset();
+        self.geometry_bspline=super::bilinear_refine::bspline_enabled();
         self.check("上传高度图")
     }
 
+    unsafe fn clear_geometry_cache(&mut self) {
+        if let Some(cache)=self.cached_geometry.take(){self.gl.delete_texture(cache.texture);}
+    }
+    unsafe fn switch_geometry(&mut self,old_refined:bool,curve:f32)->Result<(),String> {
+        let refined=super::bilinear_refine::active(&self.params);
+        let cached=self.cached_geometry.take();
+        if let Some(cache)=cached {
+            if cache.refined==refined && cache.curve==curve && (!refined || cache.bspline==super::bilinear_refine::bspline_enabled()) {
+                let previous=CachedGeometry {texture:std::mem::replace(&mut self.height_tex,cache.texture),
+                    base:std::mem::replace(&mut self.height_base,cache.base),map:std::mem::replace(&mut self.map,cache.map),
+                    padded:std::mem::replace(&mut self.padded,cache.padded),levels:std::mem::replace(&mut self.levels,cache.levels),
+                    refined:old_refined,curve,bspline:std::mem::replace(&mut self.geometry_bspline,cache.bspline)};
+                self.cached_geometry=Some(previous);self.contour_ready.set(false);return Ok(());
+            }
+            self.gl.delete_texture(cache.texture);
+        }
+        let Some(original)=self.original_map.take() else{return Ok(());};
+        let texture=match self.gl.create_texture(){Ok(t)=>t,Err(e)=>{self.original_map=Some(original);return Err(e);}};
+        let previous=CachedGeometry {texture:std::mem::replace(&mut self.height_tex,texture),
+            base:std::mem::take(&mut self.height_base),map:self.map,padded:self.padded,levels:self.levels,refined:old_refined,curve,bspline:self.geometry_bspline};
+        let result=self.upload_map_internal(&original,true);self.original_map=Some(original);
+        if let Err(error)=result {
+            self.gl.delete_texture(self.height_tex);self.height_tex=previous.texture;self.height_base=previous.base;
+            self.map=previous.map;self.padded=previous.padded;self.levels=previous.levels;self.geometry_bspline=previous.bspline;return Err(error);
+        }
+        self.cached_geometry=Some(previous);Ok(())
+    }
+    unsafe fn select_path(&mut self,source:String)->Result<(),String> {
+        if surface_switch_cache_enabled() && self.path_key==source {return Ok(());}
+        let next=if surface_switch_cache_enabled() {
+            if let Some(index)=self.cached_paths.iter().position(|(key,_)|*key==source){self.cached_paths.remove(index).1}
+            else{program(&self.gl,&source)?}
+        }else{program(&self.gl,&source)?};
+        let old=std::mem::replace(&mut self.path,next);let old_key=std::mem::replace(&mut self.path_key,source);
+        if surface_switch_cache_enabled(){
+            self.cached_paths.push((old_key,old));
+            if self.cached_paths.len()>4 {let (_,program)=self.cached_paths.remove(0);self.gl.delete_program(program);}
+        }else{self.gl.delete_program(old);for (_,p) in self.cached_paths.drain(..){self.gl.delete_program(p);}}
+        Ok(())
+    }
+
     unsafe fn upload_height_levels(&self, curve: f32) {
-        let mut data = curved_height_texture(&self.height_base, curve);
+        let mut data = curved_height_texture(&self.height_base, if super::bilinear_refine::active(&self.params){1.}else{curve});
         self.gl
             .bind_texture(glow::TEXTURE_2D, Some(self.height_tex));
         self.texture_filter(glow::NEAREST_MIPMAP_NEAREST, glow::CLAMP_TO_EDGE);
@@ -442,8 +542,13 @@ impl GlRenderer {
     }
 
     pub unsafe fn set_params(&mut self, p: &RenderParams) -> Result<(), String> {
-        if p.fog_density != 0. || p.bloom != 0. {
-            return Err("OpenGL 基线尚未启用雾和 Bloom".into());
+        validate_camera_frame(p)?;
+        super::background::validate(p)?;
+        super::fog::validate(p)?;
+        super::cloud::validate(p)?;
+        super::water::validate(p)?;
+        if p.bloom != 0. {
+            return Err("OpenGL 基线尚未启用 Bloom".into());
         }
         if !["cube", "poly", "bilinear", "bicubic"].contains(&p.surface.as_str()) {
             return Err("未知表面类型".into());
@@ -508,6 +613,7 @@ impl GlRenderer {
         }
         validate_display_parameters(p)?;
         validate_contour_parameters(p)?;
+        super::validate_appearance_parameters(p)?;
         let max = self.gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) as u32;
         if p.width > max || p.height > max {
             return Err("输出尺寸超过 GPU 限制".into());
@@ -529,23 +635,31 @@ impl GlRenderer {
             || old.experimental_bounces != p.experimental_bounces
             || old.projection != p.projection
             || old.grid != p.grid
+            || old.ground_enabled != p.ground_enabled
             || old.export_shadow != p.export_shadow
             || (old.height_step > 0.) != (p.height_step > 0.)
         {
-            let new = program(&self.gl, &path_source(p, self.geo_tile.is_some()))?;
-            self.gl.delete_program(self.path);
-            self.path = new;
+            self.select_path(path_source(p,self.geo_tile.is_some()))?;
         }
+        let old=&self.params;
         let resize = old.width != p.width || old.height != p.height
             || old.output_bit_depth != p.output_bit_depth
             || (old.stretch_type != "none") != (p.stretch_type != "none")
             || needs_surface(old) != needs_surface(p);
         let curve_changed = effective_height_curve(old) != effective_height_curve(p);
-        if curve_changed && !self.height_base.is_empty() && !self.paged_geometry {
+        let old_refined=super::bilinear_refine::active(old);
+        let refine_changed=super::bilinear_refine::active(old)!=super::bilinear_refine::active(p);
+        let rebuild_map=!self.paged_geometry && (refine_changed || (curve_changed && super::bilinear_refine::active(p)));
+        if curve_changed || self.paged_geometry {self.clear_geometry_cache();}
+        if curve_changed && !rebuild_map && !self.height_base.is_empty() && !self.paged_geometry {
             self.upload_height_levels(effective_height_curve(p));
             self.check("更新高度曲线")?;
         }
         self.params = p.clone();
+        if rebuild_map {
+            if surface_switch_cache_enabled() && !curve_changed {self.switch_geometry(old_refined,effective_height_curve(p))?;}
+            else if let Some(map)=self.original_map.clone(){self.upload_map(&map)?;}
+        }
         if resize {
             self.allocate()?;
         } else {
@@ -571,9 +685,7 @@ impl GlRenderer {
             }
         }
         if self.geo_tile.is_some() != tile.is_some() {
-            let next = program(&self.gl, &path_source(&self.params, tile.is_some()))?;
-            self.gl.delete_program(self.path);
-            self.path = next;
+            self.select_path(path_source(&self.params,tile.is_some()))?;
         }
         if self.geo_tile != tile {
             self.geo_tile = tile;
@@ -770,7 +882,8 @@ impl GlRenderer {
         let map = self.map.as_ref().unwrap();
         let (map_width, map_height, map_span) = (map.width, map.height, map.span);
         self.gl.use_program(Some(pr));
-        self.i(pr, "surface_pass", 0);
+        self.i(pr, "surface_pass", self.export_layer);
+        self.v2(pr, "export_depth_range", self.export_depth);
         self.i(pr, "appearance_color_blend", i32::from(elevation_color_blend(&p)));
         self.i(
             pr,
@@ -791,6 +904,7 @@ impl GlRenderer {
         self.v2(pr, "output_full_size", full);
         self.v2(pr, "output_tile_origin", origin);
         self.i(pr, "output_tiled", i32::from(self.output_tile.is_some()));
+        self.v2(pr, "camera_frame", [p.camera_frame_x, p.camera_frame_y]);
         let shortest = full[0].min(full[1]);
         self.v2(pr, "aspect", [full[0] / shortest, full[1] / shortest]);
         if advance_random {self.advance_sample_uniforms(pr, &p);}
@@ -873,15 +987,30 @@ impl GlRenderer {
             let c = material_albedo(&p)?;
             [c[0], c[1], c[2], 1.]
         });
-        self.v4(pr, "K_ground", [0.18, 0.18, 0.18, 1.]);
+        let ground=if p.ground_color.eq_ignore_ascii_case("#767676") {[0.18;3]} else {parse_srgb_color(&p.ground_color)?};
+        self.v4(pr, "K_ground", [ground[0],ground[1],ground[2],1.]);
+        self.i(pr,"scene_background_mode",if self.geo_tile.is_some(){0}else{match p.background_mode.as_str(){"solid"=>1,"gradient"=>2,_=>0}});
+        self.i(pr,"scene_background_transition",i32::from(super::background::transition_active(&p) && self.geo_tile.is_none()));
+        self.f(pr,"scene_background_physical_weight",super::background::physical_weight(&p));
+        self.i(pr,"scene_ground_shadow",i32::from(p.ground_shadow));
+        self.f(pr,"scene_fog_density",if p.fog_enabled {p.fog_density * 0.01} else {0.});
+        self.f(pr,"scene_fog_scale",map_width.max(map_height) as f32);
+        self.f(pr,"scene_fog_start",p.fog_start * 0.01);
+        self.f(pr,"scene_fog_end",p.fog_end * 0.01);
+        self.f(pr,"scene_fog_height_enabled",if p.fog_height_enabled {1.} else {0.});
+        self.f(pr,"scene_fog_height_base",p.fog_height_base * 0.01);
+        self.f(pr,"scene_fog_height_falloff",p.fog_height_falloff * 0.01);
+        self.v3(pr,"scene_fog_color",parse_srgb_color(&p.fog_color)?);
+        self.i(pr,"scene_layout_shadow_only",i32::from(p.layout_shadow_only));
+        self.i(pr,"scene_background_transparent",i32::from(p.export_transparent && self.geo_tile.is_none()));
+        self.f(pr,"material_specular",if material_specular_enabled(&p) {p.material_specular}else{0.});
+        self.f(pr,"material_roughness",p.material_roughness);
+        self.v3(pr,"material_specular_color",parse_srgb_color(&p.material_specular_color)?);
+        self.bind_ramp(pr);
         self.i(
             pr,
             "appearance_mode",
-            match p.appearance_mode.as_str() {
-                "texture" => 1,
-                "elevation" => 2,
-                _ => 0,
-            },
+            if elevation_enabled(&p) {2} else if texture_enabled(&p) {1} else {0},
         );
         self.i(
             pr,
@@ -928,7 +1057,7 @@ impl GlRenderer {
         self.v2(pr, "cmap_scale", [1., 1.]);
         self.v2(pr, "cmap_offset", [0., 0.]);
         self.f(pr, "cmap_gamma", 1.);
-        if p.sky_model == "atmosphere" && self.sky_altitude != Some(p.sun_altitude) {
+        if (p.sky_model == "atmosphere" || p.transition_sky_model.is_some_and(|v|v>0.)) && self.sky_altitude != Some(p.sun_altitude) {
             let lut = super::sky::SkyLut::new(p.sun_altitude);
             self.gl.active_texture(glow::TEXTURE0 + 3);
             self.gl.bind_texture(glow::TEXTURE_2D, Some(self.sky_tex));
@@ -941,9 +1070,18 @@ impl GlRenderer {
             self.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::REPEAT as i32);
             self.sky_altitude = Some(lut.altitude);
             self.sky_mean = lut.mean_rgb;
+            self.sky_follow_mean=lut.follow_mean_rgb;
         }
         self.i(pr, "sky_model", i32::from(p.sky_model == "atmosphere"));
         self.f(pr, "sky_azimuth", p.sun_azimuth.to_radians());
+        self.i(pr,"sky_follow_light",i32::from(p.sky_follow_light));
+        self.f(pr,"transition_sky_follow",p.transition_sky_follow.unwrap_or(-1.));
+        self.f(pr,"transition_sky_model",p.transition_sky_model.unwrap_or(-1.));
+        self.i(pr,"scene_sky_follow",i32::from(p.sky_follow_light && super::background::physical_weight(&p)<=0.));
+        let (sky_full,sky_origin)=output_tile_mapping(self.output_tile,[p.width,p.height]);
+        self.v2(pr,"scene_sky_axis",projected_light_axis(&p,sky_full));
+        self.v2(pr,"scene_sky_full_size",sky_full);
+        self.v2(pr,"scene_sky_tile_origin",sky_origin);
         self.i(pr, "max_num_diffuse", p.max_bounces as i32);
         self.i(pr, "max_num_specular", 0);
         self.i(pr, "max_num_scatter", 0);
@@ -953,9 +1091,16 @@ impl GlRenderer {
         self.v4(pr, "surf_mask_diffuse", [1., 1., 0., 0.]);
         let sky = parse_color(&p.sky_color)?.map(|v| v * p.sky_intensity / 100. * 0.1);
         self.v3(pr, "Le", sky);
-        self.v3(pr, "sky_mean_radiance", std::array::from_fn(|i|
-            sky[i] * if p.sky_model == "atmosphere" {self.sky_mean[i]} else {1.}));
-        let transmission = if p.sky_model == "atmosphere" {
+        self.v3(pr, "sky_mean_radiance", std::array::from_fn(|i| {
+            let mean=if let Some(follow)=p.transition_sky_follow {self.sky_mean[i]*(1.-follow)+self.sky_follow_mean[i]*follow}
+                else if p.sky_follow_light {self.sky_follow_mean[i]} else {self.sky_mean[i]};
+            let environment=if let Some(model)=p.transition_sky_model {1.+(mean-1.)*model}
+                else if p.sky_model=="atmosphere" {mean} else {1.};
+            sky[i]*environment
+        }));
+        let transmission = if let Some(model)=p.transition_sky_model {
+            super::sky::direct_sun_transmittance(p.sun_altitude).map(|value|1.+(value-1.)*model)
+        } else if p.sky_model == "atmosphere" {
             super::sky::direct_sun_transmittance(p.sun_altitude)
         } else { [1.; 3] };
         let sun_color = parse_color(&p.sun_color)?;
@@ -970,6 +1115,7 @@ impl GlRenderer {
         let az = p.sun_azimuth.to_radians();
         let alt = p.sun_altitude.to_radians();
         let sun = [alt.cos() * az.cos(), alt.cos() * az.sin(), alt.sin()];
+        self.v3(pr,"sky_sun_direction",sun);
         self.matrix(pr, "sun_rot", basis(sun));
         self.f(
             pr,
@@ -990,6 +1136,12 @@ impl GlRenderer {
                 [p.width, p.height],
                 zmax.max(0.01) + 1.,
             );
+            // Metadata rays must use the same integer global pixel mapping in
+            // every tile; interpolated normalized st can flip near-zero hits.
+            self.v2(pr,"surface_geo_offset",[tile[0] as f32-grid[2] as f32,tile[1] as f32-grid[3] as f32+tile[3] as f32]);
+            self.v2(pr,"surface_geo_scale",[map_width as f32/grid[0] as f32,map_height as f32/grid[1] as f32]);
+            self.v2(pr,"surface_geo_pixel",[tile[2] as f32/p.width as f32,tile[3] as f32/p.height as f32]);
+            self.f(pr,"surface_geo_height",map_height as f32);
             self.v3(pr, "view_origin", origin);
             self.v2(pr, "geo_pixel_step", pixel_step);
             self.matrix(pr, "view_rot", [1., 0., 0., 0., 1., 0., 0., 0., 1.]);
@@ -1039,14 +1191,16 @@ impl GlRenderer {
         &self,
         view_width: u32,
         view_height: u32,
+        backing_height: u32,
         overlays: &[OverlayRect],
     ) -> Result<(), String> {
         if view_width == 0 || view_height == 0 {
             return Ok(());
         }
         self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        let viewport_y = backing_height.saturating_sub(view_height);
         self.gl
-            .viewport(0, 0, view_width as i32, view_height as i32);
+            .viewport(0, viewport_y as i32, view_width as i32, view_height as i32);
         self.gl.clear_color(0.075, 0.078, 0.085, 1.0);
         self.gl.clear(glow::COLOR_BUFFER_BIT);
         let (size, origin) = cover_mapping(
@@ -1056,6 +1210,7 @@ impl GlRenderer {
         let glass = glass_uniforms(overlays, [view_width, view_height]);
         self.gl.disable(glow::BLEND);
         self.gl.use_program(Some(self.copy));
+        self.f(self.copy, "viewport_y", viewport_y as f32);
         self.gl.bind_vertex_array(Some(self.vao));
         self.bind_tex(self.copy, "image", 0, if self.params.stretch_type != "none" { self.filtered } else { self.output });
         self.v2(self.copy, "output_size", size);
@@ -1076,6 +1231,18 @@ impl GlRenderer {
         }
         self.gl.draw_arrays(glow::TRIANGLES, 0, 3);
         self.check("显示")
+    }
+
+    /// One readback per native sizing gesture, from the complete display copy.
+    pub(super) unsafe fn retain_presented_frame(&self, width:u32, height:u32, backing_height:u32) -> Result<Vec<u8>,String> {
+        self.gl.bind_framebuffer(glow::FRAMEBUFFER,None);
+        self.gl.read_buffer(glow::BACK);
+        self.gl.pixel_store_i32(glow::PACK_ALIGNMENT,1);
+        let mut pixels=vec![0u8;width as usize*height as usize*4];
+        self.gl.read_pixels(0,backing_height.saturating_sub(height) as i32,width as i32,height as i32,
+            glow::BGRA,glow::UNSIGNED_BYTE,glow::PixelPackData::Slice(Some(&mut pixels)));
+        self.check("保留缩放画面")?;
+        Ok(pixels)
     }
 
     /// Export-only filters never enter native viewport presentation or raw capture.
@@ -1125,12 +1292,60 @@ impl GlRenderer {
         }
         Ok(out)
     }
+    /// Independent data passes bypass all display transforms and scene fog.
+    pub fn set_export_layer(&mut self, layer: &str) -> Result<(), String> {
+        self.export_layer = match layer { "beauty" => 0, "normal" => 2, "depth" => 3, "shadow" => 4, _ => return Err("未知导出图层".into()) };
+        Ok(())
+    }
+    pub fn set_export_depth_range(&mut self, range: [f32; 2]) -> Result<(), String> {
+        if !range.iter().all(|v| v.is_finite()) || range[0] < 0. || range[1] <= range[0] { return Err("无效的深度范围".into()); }
+        self.export_depth = range; Ok(())
+    }
+    pub fn export_depth_range(&self) -> [f32; 2] {
+        self.export_depth_range_for(&self.params)
+    }
+    /// Computes one full-frame range from the export snapshot without allocating output storage.
+    pub fn export_depth_range_for(&self, p: &RenderParams) -> [f32; 2] {
+        let Some(map) = self.map.as_ref() else { return [0., 1.] };
+        let dim = map.width.max(map.height) as f32;
+        let vertical = map.span * p.height_scale;
+        let low = height_offset(map.width,map.height,p);
+        let high = low + vertical + p.height_step*p.height_scale + 0.01;
+        if self.geo_grid.is_some() || self.geo_tile.is_some() { let origin_z=high.max(0.01)+1.; return [(origin_z-high).max(0.),(origin_z-low).max(1e-3)]; }
+        let target = camera_target(map.width,map.height,vertical,p);
+        let pitch = (if p.projection=="isometric" {35.26439} else {p.camera_pitch.clamp(0.,90.)}).to_radians();
+        let yaw = p.camera_yaw.to_radians(); let d = dim*1.4*p.camera_distance/10.;
+        let eye = [target[0]+yaw.cos()*pitch.cos()*d,target[1]+yaw.sin()*pitch.cos()*d,target[2]+pitch.sin()*d];
+        let center = [map.width as f32*0.5,map.height as f32*0.5,(low+high)*0.5];
+        let distance = if p.projection=="perspective" {(0..3).map(|i|(eye[i]-center[i]).powi(2)).sum::<f32>().sqrt()} else {(eye[0]-center[0])*yaw.cos()*pitch.cos()+(eye[1]-center[1])*yaw.sin()*pitch.cos()+(eye[2]-center[2])*pitch.sin()};
+        let radius = ((map.width as f32).powi(2)+(map.height as f32).powi(2)+(high-low).powi(2)).sqrt()*0.5;
+        [(distance-radius).max(0.),(distance+radius).max((distance-radius).max(0.)+1e-3)]
+    }
+    pub unsafe fn read_export_layer_pixels(&self, depth: u8) -> Result<Vec<u8>, String> {
+        if self.export_layer==0 || ![8,16].contains(&depth) { return Err("无效的图层读回".into()); }
+        let (w,h)=(self.params.width as usize,self.params.height as usize);
+        let mut values=vec![0f32;w*h*4];
+        self.gl.bind_framebuffer(glow::FRAMEBUFFER,Some(self.accum_fbo));
+        self.gl.pixel_store_i32(glow::PACK_ALIGNMENT,1);
+        self.gl.read_pixels(0,0,w as i32,h as i32,glow::RGBA,glow::FLOAT,glow::PixelPackData::Slice(Some(std::slice::from_raw_parts_mut(values.as_mut_ptr().cast(),values.len()*4))));
+        self.check("独立图层读回")?;
+        let mut result=Vec::with_capacity(w*h*4*usize::from(depth/8));
+        for y in (0..h).rev() { for px in values[y*w*4..(y+1)*w*4].chunks_exact(4) {
+            for (channel,&v) in px.iter().enumerate() { let v=if channel<3 && px[3]>0. {v/px[3]}else{v}; let v=if v.is_finite(){v.clamp(0.,1.)}else{0.};
+                if depth==16 { result.extend_from_slice(&((v*65535.).round() as u16).to_ne_bytes()); } else {result.push((v*255.).round() as u8);}
+            }
+        }}
+        clear_transparent_rgb(&mut result,depth); Ok(result)
+    }
     pub fn samples(&self) -> u32 {
         self.count
     }
     pub fn sample_pending(&self) -> bool {
         self.tile_fence.is_some() || self.sample_job.row > 0
     }
+    /// Identity of the pixels actually written to the viewport output FBO.
+    pub fn output_identity(&self) -> Option<serde_json::Value> { self.output_identity.borrow().as_ref().and_then(|identity|serde_json::to_value(identity).ok()) }
+    pub fn content_generation(&self) -> u64 { self.content_generation }
     pub fn dimensions(&self) -> (u32, u32) {
         (self.params.width, self.params.height)
     }
@@ -1157,6 +1372,7 @@ impl GlRenderer {
         }
     }
     unsafe fn allocate(&mut self) -> Result<(), String> {
+        self.output_identity.replace(None);
         let high = self.params.output_bit_depth == 16;
         let output_format = if high { glow::RGBA16 } else { glow::RGBA8 };
         let output_kind = if high { glow::UNSIGNED_SHORT } else { glow::UNSIGNED_BYTE };
@@ -1220,7 +1436,55 @@ impl GlRenderer {
         self.reset();
         self.check("分配渲染缓冲")
     }
+    unsafe fn bind_ramp(&self, program: glow::Program) {
+        let p=&self.params;
+        self.i(program,"ramp_stop_count",super::ramp::count(p));
+        self.i(program,"ramp_reverse",i32::from(p.ramp_reverse));
+        self.i(program,"ramp_wrap",i32::from(p.ramp_wrap));
+        self.f(program,"ramp_offset",p.ramp_offset);
+        self.i(program,"ramp_custom_range",i32::from(p.ramp_range_mode=="custom"));
+        let map=self.map;
+        let range=map.map(|m|m.source_elevation).unwrap_or([0.,100.]);
+        // SourceMetadata encodes numeric TIFF samples with a nonzero sentinel.
+        let numeric=map.is_some_and(|m|m.numeric_height);
+        self.i(program,"ramp_numeric",i32::from(numeric));
+        // Subtract custom origin on the CPU to retain large-offset precision.
+        self.v2(program,"ramp_source_range",[(range[0]-p.ramp_min) as f32,range[1] as f32]);
+        self.v2(program,"ramp_user_range",[0.,(p.ramp_max-p.ramp_min) as f32]);
+        for (index,stop) in p.ramp_stops.iter().enumerate() {
+            self.f(program,&format!("ramp_positions[{index}]"),stop.position);
+            self.v3(program,&format!("ramp_stop_colors[{index}]"),parse_color(&stop.color).unwrap_or([0.;3]));
+        }
+    }
+
+    pub(super) fn appearance_range(&self) -> Option<[f64;2]> {
+        self.map.map(|map| {let [low,span]=map.source_elevation; [low,low+span]})
+    }
+
+
+    pub(super) unsafe fn sample_appearance(&self,x:f32,y:f32)->Result<super::AppearanceSample,String> {
+        if !x.is_finite() || !y.is_finite() || !(0. ..1.).contains(&x) || !(0. ..1.).contains(&y) {
+            return Err("取样位置无效".into());
+        }
+        if !self.params.appearance_pick || !self.surface_ready.get() || self.count==0 {
+            return Err("取样画面尚未就绪".into());
+        }
+        let map=self.map.ok_or("尚无高度图")?;
+        let mut bytes=[0u8;16];
+        self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER,Some(self.surface_fbo));
+        self.gl.read_pixels((x*self.params.width as f32) as i32,((1.-y)*self.params.height as f32).floor().min((self.params.height-1) as f32) as i32,
+            1,1,glow::RGBA,glow::FLOAT,glow::PixelPackData::Slice(Some(&mut bytes)));
+        self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER,None);
+        self.check("读取地形高程")?;
+        let values:[f32;4]=std::array::from_fn(|i|f32::from_ne_bytes(bytes[i*4..i*4+4].try_into().unwrap()));
+        if values[1]<0.5 || !values.iter().all(|v|v.is_finite()) {return Err("该位置没有地形".into());}
+        let t=if map.numeric_height {((values[0]-1e-6)/(1.-1e-6)).clamp(0.,1.)}else{values[0]};
+        let [low,span]=map.source_elevation;
+        Ok(super::AppearanceSample{height:low+f64::from(t)*span,normalized_height:t,uv:[values[2],values[3]],range:self.appearance_range().unwrap()})
+    }
+
     unsafe fn reset(&mut self) {
+        self.content_generation = self.content_generation.wrapping_add(1);
         // The GPU cannot interrupt an issued strip. Retain its fence so the
         // replacement frame cannot queue more work until that strip finishes.
         self.tile_discarded = self.tile_fence.is_some();
@@ -1237,6 +1501,67 @@ impl GlRenderer {
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
             self.gl.clear(glow::COLOR_BUFFER_BIT);
         }
+    }
+    unsafe fn prepare_cloud_post(&self,p:glow::Program,active:bool) {
+        let (full,origin)=output_tile_mapping(self.output_tile,[self.params.width,self.params.height]);
+        self.v2(p,"output_full_size",full);self.v2(p,"output_tile_origin",origin);self.i(p,"output_tiled",i32::from(self.output_tile.is_some()));
+        self.bind_tex(p,"workflow_surface",4,self.surface_info);
+        for (name,value) in display_uniforms(&self.params) {self.f(p,name,value);}
+        let params=&self.params;
+        let az=params.sun_azimuth.to_radians();let alt=params.sun_altitude.to_radians();
+        let sun=[alt.cos()*az.cos(),alt.cos()*az.sin(),alt.sin()];
+        self.v3(p,"scene_cloud_sun_direction",sun);
+        self.f(p,"scene_cloud_shadow_strength",if params.cloud_enabled&&params.cloud_shadow_enabled{params.cloud_shadow_strength*0.01}else{0.});
+        self.i(p,"water_enabled",i32::from(params.water_enabled));
+        self.f(p,"water_level",params.water_level*0.01);self.f(p,"water_opacity",params.water_opacity*0.01);
+        self.f(p,"water_roughness",params.water_roughness);
+        self.v3(p,"water_color",parse_color(&params.water_color).unwrap_or([0.;3]));
+        self.v3(p,"water_sun_direction",sun);
+        let sky=parse_color(&params.sky_color).unwrap_or([1.;3]);let solar=parse_color(&params.sun_color).unwrap_or([1.;3]);
+        let attenuation=if params.sky_model=="atmosphere"{super::sky::direct_sun_transmittance(params.sun_altitude)}else{[1.;3]};
+        self.v3(p,"water_sky_color",std::array::from_fn(|i|(sky[i]*if params.sky_model=="atmosphere"{self.sky_mean[i]}else{1.}*params.sky_intensity*0.01).clamp(0.,1.)));
+        self.v3(p,"water_sun_color",std::array::from_fn(|i|solar[i]*attenuation[i]*params.sun_intensity*0.01));
+        self.f(p,"scene_cloud_density",if self.params.cloud_enabled {self.params.cloud_density*0.01}else{0.});
+        self.f(p,"scene_cloud_coverage",self.params.cloud_coverage*0.01);
+        self.f(p,"scene_cloud_height",self.params.cloud_height*0.01);
+        self.f(p,"scene_cloud_thickness",self.params.cloud_thickness*0.01);
+        self.f(p,"scene_cloud_scale",self.params.cloud_scale*0.01);
+        self.f(p,"scene_cloud_range",self.params.cloud_range*0.01);
+        self.f(p,"scene_cloud_seed",self.params.cloud_seed as f32);
+        self.i(p,"scene_cloud_seed_count",self.params.transition_cloud_seeds.len() as i32);
+        for (i,component) in self.params.transition_cloud_seeds.iter().enumerate() {
+            self.f(p,&format!("scene_cloud_seeds[{i}]"),component.seed as f32);
+            self.f(p,&format!("scene_cloud_seed_weights[{i}]"),component.weight);
+        }
+        self.v2(p,"scene_cloud_offset",[self.params.cloud_offset_x*0.01,self.params.cloud_offset_y*0.01]);
+        self.v3(p,"scene_cloud_color",parse_color(&self.params.cloud_color).unwrap_or([1.;3]));
+        self.i(p,"cloud_bypass",i32::from(self.params.layout_shadow_only||self.export_layer!=0||!active));
+        self.i(p,"cloud_ground_enabled",i32::from(self.params.ground_enabled&&self.geo_tile.is_none()));
+        self.f(p,"cloud_height_curve",effective_height_curve(&self.params));
+        if let Some(map)=self.map {
+            let w=map.width;let h=map.height;let dim=w.max(h) as f32;
+            let vertical=map.span*self.params.height_scale;let offset=height_offset(w,h,&self.params);
+            self.f(p,"scene_cloud_world_scale",dim);
+            self.v2(p,"scene_cloud_extent",[w as f32/dim,h as f32/dim]);
+            self.v3(p,"cloud_map_geometry",[(w-1) as f32,(h-1) as f32,vertical]);
+            self.f(p,"cloud_height_offset",offset);
+            self.i(p,"cloud_map_origin",i32::from(self.geo_tile.is_some()));
+            if let Some(tile)=self.geo_tile {
+                let zmax=vertical+offset+self.params.height_step*self.params.height_scale+0.01;
+                let (origin,step)=geo_grid_mapping([w,h],self.geo_grid.unwrap_or([w,h,0,0]),tile,[self.params.width,self.params.height],zmax.max(0.01)+1.);
+                self.v3(p,"cloud_view_origin",origin);self.v2(p,"cloud_geo_step",step);
+                self.matrix(p,"cloud_view_rot",[1.,0.,0.,0.,1.,0.,0.,0.,1.]);
+                self.f(p,"cloud_view_fov",full[0].min(full[1])*0.5);self.i(p,"cloud_perspective",0);self.v2(p,"cloud_camera_frame",[0.,0.]);
+            }else{
+                let pitch=if self.params.projection=="isometric"{35.26439}else{self.params.camera_pitch.clamp(0.,90.)}.to_radians();let yaw=self.params.camera_yaw.to_radians();
+                let distance=dim*1.4*self.params.camera_distance/10.;let target=camera_target(w,h,vertical,&self.params);
+                self.v3(p,"cloud_view_origin",[target[0]+yaw.cos()*pitch.cos()*distance,target[1]+yaw.sin()*pitch.cos()*distance,target[2]+pitch.sin()*distance]);
+                self.matrix(p,"cloud_view_rot",camera_basis(yaw,pitch));let perspective=self.params.projection=="perspective";
+                let fov=(self.params.field_of_view.to_radians()*0.5).tan();self.f(p,"cloud_view_fov",if perspective{fov}else{distance*fov});self.i(p,"cloud_perspective",i32::from(perspective));
+                self.v2(p,"cloud_geo_step",[1.,1.]);self.v2(p,"cloud_camera_frame",[self.params.camera_frame_x,self.params.camera_frame_y]);
+            }
+        }
+
     }
     unsafe fn postprocess(&self) {
         self.postprocess_output(false);
@@ -1281,6 +1606,51 @@ impl GlRenderer {
         self.gl
             .bind_framebuffer(glow::FRAMEBUFFER, Some(self.output_fbo));
         self.gl.use_program(Some(p));
+        self.i(p,"scene_background_mode",if self.geo_tile.is_some(){0}else{match self.params.background_mode.as_str(){"solid"=>1,"gradient"=>2,_=>0}});
+        self.i(p,"scene_layout_shadow_only",i32::from(self.params.layout_shadow_only));
+        self.i(p,"scene_background_transparent",i32::from(self.params.export_transparent && self.geo_tile.is_none()));
+        let transitioning=super::background::transition_active(&self.params) && self.geo_tile.is_none();
+        self.i(p,"scene_background_transition",i32::from(transitioning));
+        self.f(p,"scene_background_mix",self.params.transition_background_mix);
+        let components=super::background::components(&self.params);
+        self.i(p,"transition_component_count",components.len() as i32);
+        for (i,c) in components.iter().enumerate(){
+            self.i(p,&format!("transition_component_mode[{i}]"),match c.mode.as_str(){"solid"=>1,"gradient"=>2,_=>0});
+            self.i(p,&format!("transition_component_follow[{i}]"),i32::from(c.sky_follow_light));
+            self.v3(p,&format!("transition_component_color[{i}]"),parse_color(&c.color).unwrap_or([0.;3]));
+            self.v3(p,&format!("transition_component_color2[{i}]"),parse_color(&c.color2).unwrap_or([0.;3]));
+            let mut state=self.params.clone();state.background_angle=c.angle;state.background_follow_light=c.follow_light;
+            let full=output_tile_mapping(self.output_tile,[self.params.width,self.params.height]).0;
+            self.v2(p,&format!("transition_component_axis[{i}]"),background_gradient_axis(&state,full));
+            self.f(p,&format!("transition_component_weight[{i}]"),c.weight);
+        }
+        let from=self.params.transition_background_from.clone().unwrap_or_default();
+        self.i(p,"scene_background_from_mode",match from.mode.as_str(){"solid"=>1,"gradient"=>2,_=>0});
+        self.v3(p,"scene_background_from_color",parse_color(&from.color).unwrap_or([0.;3]));
+        self.v3(p,"scene_background_from_color2",parse_color(&from.color2).unwrap_or([0.;3]));
+        let mut old=self.params.clone();old.background_angle=from.angle;old.background_follow_light=from.follow_light;
+        let full=output_tile_mapping(self.output_tile,[self.params.width,self.params.height]).0;
+        self.v2(p,"scene_background_from_axis",background_gradient_axis(&old,full));
+        self.v2(p,"transition_sky_axis",projected_light_axis(&self.params,full));
+        self.i(p,"transition_from_sky_follow",i32::from(from.sky_follow_light));
+        self.i(p,"transition_sky_follow",i32::from(self.params.sky_follow_light));
+        self.f(p,"transition_sky_model",self.params.transition_sky_model.unwrap_or(if self.params.sky_model=="atmosphere" {1.}else{0.}));
+        self.v3(p,"transition_sky_radiance",parse_color(&self.params.sky_color).unwrap_or([0.;3]).map(|v|v*self.params.sky_intensity*0.001));
+        self.f(p,"transition_sky_azimuth",self.params.sun_azimuth.to_radians());
+        self.bind_tex(p,"transition_sky_lut",7,self.sky_tex);
+        let pitch=if self.params.projection=="isometric" {35.26439}else{self.params.camera_pitch}.to_radians();
+        self.matrix(p,"transition_view_rot",camera_basis(self.params.camera_yaw.to_radians(),pitch));
+        self.f(p,"transition_fov",(self.params.field_of_view.to_radians()*0.5).tan());
+        self.i(p,"transition_perspective",i32::from(self.params.projection=="perspective"));
+        self.v2(p,"transition_camera_frame",[self.params.camera_frame_x,self.params.camera_frame_y]);
+
+        self.v3(p,"scene_background_color",parse_color(&self.params.background_color).unwrap_or([0.;3]));
+        self.v3(p,"scene_background_color2",parse_color(&self.params.background_color2).unwrap_or([0.;3]));
+        let (full,origin)=output_tile_mapping(self.output_tile,[self.params.width,self.params.height]);
+        self.v2(p,"scene_background_axis",background_gradient_axis(&self.params,full));
+        self.v2(p,"output_full_size",full);
+        self.v2(p,"output_tile_origin",origin);
+        self.i(p,"output_tiled",i32::from(self.output_tile.is_some()));
         self.bind_tex(p, "tex_accum", 0, self.accum);
         self.bind_tex(p, "tex_last", 1, self.accum);
         self.bind_tex(p, "tex_bloom", 2, self.accum);
@@ -1310,8 +1680,19 @@ impl GlRenderer {
         for (index,color) in self.params.ramp_colors.iter().enumerate(){self.v3(p,&format!("appearance_colors[{index}]"),parse_color(color).unwrap_or([0.;3]));}
         self.bind_tex(p,"workflow_surface",4,self.surface_info);
         self.bind_tex(p,"workflow_texture",5,self.color_tex);
+        self.bind_ramp(p);
+        self.i(p,"texture_mapping",match self.params.texture_mapping.as_str(){"planar"=>1,"triplanar"=>2,_=>0});
+        self.i(p,"texture_fit",match self.params.texture_fit.as_str(){"contain"=>1,"repeat"=>2,_=>0});
+        self.i(p,"texture_blend",match self.params.texture_blend.as_str(){"normal"=>1,"multiply"=>2,"softlight"=>3,_=>0});
+        self.f(p,"texture_scale",self.params.texture_scale);
+        self.v2(p,"texture_offset",[self.params.texture_offset_x,self.params.texture_offset_y]);
+        self.f(p,"texture_rotation",self.params.texture_rotation);
+        let geometry=self.map.map(|m|{let size=m.width.max(m.height).saturating_sub(1).max(1) as f32;[(m.width-1) as f32/size,(m.height-1) as f32/size,m.span*self.params.height_scale/size]}).unwrap_or([1.;3]);
+        self.v3(p,"workflow_geometry",geometry);
+        self.f(p,"workflow_height_curve",effective_height_curve(&self.params));
         self.v2(p,"workflow_texture_size",[self.color_size[0].max(1) as f32,self.color_size[1].max(1) as f32]);
-        self.i(p,"texture_overlay_enabled",i32::from(self.params.appearance_mode=="texture"));
+        self.i(p,"texture_overlay_enabled",i32::from(texture_enabled(&self.params)));
+        self.prepare_cloud_post(p,self.params.stretch_type=="none");
         self.f(p,"texture_opacity",self.params.texture_opacity/100.);
         self.bind_tex(p,"contour_source",6,self.contour_tex);
         self.v2(p,"contour_source_size",self.map.map(|m|[m.width as f32,m.height as f32]).unwrap_or([1.,1.]));
@@ -1351,6 +1732,15 @@ impl GlRenderer {
         self.gl.draw_arrays(glow::TRIANGLES, 0, 3);
         if self.params.stretch_type != "none" { self.apply_stretch(export); }
         self.output_dirty.set(false);
+        if !export {
+            let generation = self.output_generation.get().wrapping_add(1);
+            self.output_generation.set(generation);
+            self.output_identity.replace(Some(OutputIdentity {
+                output_generation:generation, content_generation:self.content_generation,
+                params:self.params.clone(), samples:self.count, target_samples:self.params.samples,
+                source:self.original_map.as_ref().map(|m|OutputSourceIdentity{name:m.name.clone(),width:m.width,height:m.height,raster:m.source.clone()})
+            }));
+        }
     }
     unsafe fn bind_tex(&self, p: glow::Program, name: &str, unit: u32, tex: glow::Texture) {
         self.gl.active_texture(glow::TEXTURE0 + unit);
@@ -1426,6 +1816,7 @@ impl GlRenderer {
         self.gl.bind_framebuffer(glow::FRAMEBUFFER,Some(self.filtered_fbo));
         self.gl.viewport(0,0,self.params.width as i32,self.params.height as i32);
         self.gl.use_program(Some(self.stretch_program));
+        self.prepare_cloud_post(self.stretch_program,true);
         self.bind_tex(self.stretch_program,"image",0,self.output);
         self.bind_tex(self.stretch_program,"surface_info",1,self.surface_info);
         self.bind_tex(self.stretch_program,"stretch_lut",2,self.lut_tex);
@@ -1455,6 +1846,8 @@ impl GlRenderer {
 impl Drop for GlRenderer {
     fn drop(&mut self) {
         unsafe {
+            self.clear_geometry_cache();
+            for (_,p) in self.cached_paths.drain(..){self.gl.delete_program(p);}
             if let Some(fence) = self.tile_fence.take() {
                 self.gl.delete_sync(fence);
             }
@@ -1525,7 +1918,7 @@ unsafe fn program_with_vertex(gl: &glow::Context, vertex: &str, fragment: &str) 
         shaders.push(s);
     }
     diagnostic_trace(&format!("link_begin {identity}"));
-    
+
     gl.link_program(p);
     diagnostic_trace(&format!("link_submitted {identity}"));
     let ok = gl.get_program_link_status(p);
@@ -1647,9 +2040,18 @@ fn geo_grid_mapping(
 }
 
 pub(super) fn path_source(p: &RenderParams, geo: bool) -> String {
+    let mut effective=p.clone();
+    let smooth=p.surface=="bicubic" && p.height_step==0. && super::smooth_bilinear::enabled();
+    if effective.surface=="bicubic" {effective.surface="bilinear".into();}
+    path_source_impl(&effective,geo,smooth)
+}
+// Retain the old shader generator only for independent differential oracles.
+
+fn path_source_impl(p: &RenderParams, geo: bool, smooth:bool) -> String {
     let mut source = String::from(
         "#version 330 compatibility\n#define OPT_SUN\n#define OPT_SUN_DISK\n",
     );
+    if p.layout_shadow_only { source.push_str("#define LAYOUT_SHADOW_ONLY\n"); }
     if p.surface=="bicubic"&&std::env::var("DEMSTUDIO_BICUBIC_ROOT_REBUILD").as_deref()==Ok("on"){
         source.push_str("#define BC_ROOT_REBUILD_KEYS\n");
     }
@@ -1662,8 +2064,15 @@ pub(super) fn path_source(p: &RenderParams, geo: bool) -> String {
     if p.surface=="bicubic"&&std::env::var("DEMSTUDIO_BICUBIC_ROOT_KEYS").as_deref()==Ok("on"){
         source.push_str("#extension GL_ARB_gpu_shader5 : require\n#define BC_ROOT_DYADIC_KEYS\n");
     }
-    source.push_str("uniform int surface_pass;\nuniform float height_curve;\nfloat source_height(float t){if(height_curve==1.)return t;float q=clamp((t-1e-6)/(1.-1e-6),0.,1.);return (height_curve*q/((1.-q)+height_curve*q))*(1.-1e-6)+1e-6;}\n");
-    source.push_str("uniform vec2 output_full_size,output_tile_origin;uniform int output_tiled;uniform vec2 pixel_jitter;\nvec2 output_pixel(){return gl_FragCoord.xy+(output_tiled!=0?output_tile_origin:vec2(0.));}\nvec2 output_st(vec2 original){if(output_tiled==0)return original;return (output_pixel()*2.-output_full_size)/min(output_full_size.x,output_full_size.y)+pixel_jitter;}\n");
+    source.push_str("uniform int surface_pass;\nuniform vec2 export_depth_range;\nuniform float height_curve;\nfloat source_height(float t){if(height_curve==1.)return t;float q=clamp((t-1e-6)/(1.-1e-6),0.,1.);return (height_curve*q/((1.-q)+height_curve*q))*(1.-1e-6)+1e-6;}\n");
+    source.push_str("uniform vec2 output_full_size,output_tile_origin;uniform int output_tiled;uniform vec2 pixel_jitter;uniform vec2 camera_frame;uniform vec2 surface_geo_offset,surface_geo_scale,surface_geo_pixel;uniform float surface_geo_height;\nvec2 output_pixel(){return gl_FragCoord.xy+(output_tiled!=0?output_tile_origin:vec2(0.));}\n");
+    source.push_str(if geo {
+        "vec2 output_st(vec2 original){if(output_tiled==0)return original;return (output_pixel()*2.-output_full_size)/min(output_full_size.x,output_full_size.y)+pixel_jitter;}\n"
+    } else {
+        "vec2 output_st(vec2 original){if(output_tiled==0)return original+camera_frame;return (output_pixel()*2.-output_full_size)/min(output_full_size.x,output_full_size.y)+pixel_jitter+camera_frame;}\n"
+    });
+    source.push_str(super::background::HEADER);
+    source.push_str(super::fog::HEADER);
     source.push_str(match p.surface.as_str() {
         "cube" => "#define PRIM_CUBE\n",
         "poly" => "#define PRIM_POLY\n",
@@ -1675,9 +2084,8 @@ pub(super) fn path_source(p: &RenderParams, geo: bool) -> String {
     } else {
         "#define OPT_ORTH\n"
     });
-    if p.grid && !geo {
-        source.push_str("#define OPT_GRID\n#define OPT_GROUND\n");
-    }
+    if p.ground_enabled && !geo {source.push_str("#define OPT_GROUND\n");}
+    if p.grid && p.ground_enabled && !geo {source.push_str("#define OPT_GRID\n");}
     if geo {
         source.push_str("uniform vec2 geo_pixel_step;uniform int geo_shadow_catcher;\n");
     }
@@ -1737,7 +2145,7 @@ pub(super) fn path_source(p: &RenderParams, geo: bool) -> String {
             format!(
                 "{}\n{}\n{}",
                 &block[..start],
-                include_str!("appearance.glsl").replace("float t=(p.z-appearance_height.x)/max(appearance_height.y,1e-12);", "float t=source_height((p.z-appearance_height.x)/max(appearance_height.y,1e-12));"),
+                super::ramp::source(include_str!("appearance.glsl")).replace("float t=(p.z-appearance_height.x)/max(appearance_height.y,1e-12);", "float t=source_height((p.z-appearance_height.x)/max(appearance_height.y,1e-12));"),
                 &block[end..]
             )
         } else {
@@ -1786,6 +2194,12 @@ pub(super) fn path_source(p: &RenderParams, geo: bool) -> String {
         } else {
             block
         };
+        let block=if p.surface=="bilinear" && p.height_step==0. && super::bilinear_shadow_precision::enabled() && block.contains("float bi_delta(") {
+            super::bilinear_shadow_precision::source(&block)
+        } else {block};
+        let block=if smooth && p.surface=="bilinear" && p.height_step==0. && block.contains("float bi_delta(") {
+            super::smooth_bilinear::source(&block)
+        } else {block};
         let block = if p.surface=="bilinear"&&std::env::var("DEMSTUDIO_BILINEAR_STABLE_ROOT").as_deref()==Ok("on") {
             block.replace("float mid=(e.x+e.y)*0.5;float sm=sign(bi_delta(o+dir*mid,h,i_pos,inv));e=mix(vec2(e.x,mid),vec2(mid,e.y),step(0.0,sm));",
                 "vec2 previous_e=e;float mid=(e.x+e.y)*0.5;float sm=sign(bi_delta(o+dir*mid,h,i_pos,inv));e=mix(vec2(e.x,mid),vec2(mid,e.y),step(0.0,sm));if(all(equal(floatBitsToUint(e),floatBitsToUint(previous_e))))break;")
@@ -1799,12 +2213,20 @@ pub(super) fn path_source(p: &RenderParams, geo: bool) -> String {
         } else {
             block
         };
-        source.push_str(&block);
+        let block=super::appearance::shader::material_source(&block);
+        source.push_str(&super::fog::transform_block(&super::background::transform_block(&block)));
         source.push('\n');
     }
-    source.replace("sample_ray(output_st(st),o,dir,A);", "sample_ray(output_st(st),o,dir,A);if(surface_pass!=0){float d=INF;vec3 n=vec3(0.);vec2 id=ray_vs_world(o,dir,d,n);if(is_map(id.y)&&!is_n_zero(n)){float t=source_height((o.z+dir.z*d-appearance_height.x)/max(appearance_height.y,1e-12));vec2 tex_st=clamp((o.xy+dir.xy*d-vec2(appearance_origin))/max(appearance_extent-1.,vec2(1.)),0.,1.);gl_FragColor=vec4(clamp(t,0.,1.),1.,tex_st);}else gl_FragColor=vec4(0.);return;}")
+    let metadata_origin=if geo {"if(surface_pass==1){vec2 metadata_pixel=gl_FragCoord.xy;o.xy=vec2(.5+(surface_geo_offset.x+metadata_pixel.x*surface_geo_pixel.x)*surface_geo_scale.x,.5+surface_geo_height-(surface_geo_offset.y-metadata_pixel.y*surface_geo_pixel.y)*surface_geo_scale.y);}"}else{""};
+    source.replace("sample_ray(output_st(st),o,dir,A);", "sample_ray(output_st(st),o,dir,A);if(surface_pass!=0){float d=INF;vec3 n=vec3(0.);vec2 id=ray_vs_world(o,dir,d,n);if(surface_pass>=2){if(is_map(id.y)&&!is_n_zero(n)){vec3 value=surface_pass==2?normalize(n)*0.5+.5:vec3(clamp((export_depth_range.y-d)/max(export_depth_range.y-export_depth_range.x,1e-12),0.,1.));if(surface_pass==4)value=vec3(shadow(o+dir*d,LIGHT0.o.xyz,INF));gl_FragColor=vec4(value,1.);}else gl_FragColor=vec4(0.);return;}if(is_map(id.y)&&!is_n_zero(n)){float t=source_height((o.z+dir.z*d-appearance_height.x)/max(appearance_height.y,1e-12));vec2 tex_st=clamp((o.xy+dir.xy*d-vec2(appearance_origin))/max(appearance_extent-1.,vec2(1.)),0.,1.);gl_FragColor=vec4(clamp(t,0.,1.),1.,tex_st);}else gl_FragColor=vec4(0.);return;}").replace("if(surface_pass!=0){float d=INF;",&format!("if(surface_pass!=0){{{metadata_origin}float d=INF;"))
 }
 fn copy_display_fields(from: &RenderParams,to: &mut RenderParams) {
+    to.water_level=from.water_level;to.water_opacity=from.water_opacity;to.water_roughness=from.water_roughness;to.water_color=from.water_color.clone();
+    to.cloud_shadow_enabled=from.cloud_shadow_enabled;to.cloud_shadow_strength=from.cloud_shadow_strength;
+    if from.appearance_layers_version == 1 && to.appearance_layers_version == 1 {
+        to.appearance_mode=from.appearance_mode.clone();
+    }
+    to.texture_enabled=from.texture_enabled;
     to.exposure=from.exposure;
     to.gamma=from.gamma;
     to.scene_exposure=from.scene_exposure;
@@ -1821,6 +2243,13 @@ fn copy_display_fields(from: &RenderParams,to: &mut RenderParams) {
     to.texture_highlights=from.texture_highlights;
     to.texture_saturation=from.texture_saturation;
     to.texture_opacity=from.texture_opacity;
+    to.texture_mapping=from.texture_mapping.clone();
+    to.texture_fit=from.texture_fit.clone();
+    to.texture_scale=from.texture_scale;
+    to.texture_offset_x=from.texture_offset_x;
+    to.texture_offset_y=from.texture_offset_y;
+    to.texture_rotation=from.texture_rotation;
+    to.texture_blend=from.texture_blend.clone();
     to.contour_interval=from.contour_interval;
     to.contour_width=from.contour_width;
     to.contour_smoothing=from.contour_smoothing;
@@ -1828,6 +2257,17 @@ fn copy_display_fields(from: &RenderParams,to: &mut RenderParams) {
     to.contour_opacity=from.contour_opacity;
     to.contour_major_every=from.contour_major_every;
     to.contour_major_width=from.contour_major_width;
+    to.cloud_coverage=from.cloud_coverage;
+    to.cloud_density=from.cloud_density;
+    to.cloud_height=from.cloud_height;
+    to.cloud_thickness=from.cloud_thickness;
+    to.cloud_scale=from.cloud_scale;
+    to.cloud_range=from.cloud_range;
+    to.cloud_offset_x=from.cloud_offset_x;
+    to.cloud_offset_y=from.cloud_offset_y;
+    to.cloud_seed=from.cloud_seed;
+    to.transition_cloud_seeds=from.transition_cloud_seeds.clone();
+    to.cloud_color=from.cloud_color.clone();
     to.output_contrast=from.output_contrast;
     to.output_saturation=from.output_saturation;
     to.output_temperature=from.output_temperature;
@@ -1865,16 +2305,27 @@ fn contour_source_pixels(encoded: &[f32],size: [u32;2],stride: u32) -> Vec<f32> 
 }
 
 
-fn source_elevation_range(map: &HeightMap) -> [f64;2] {
+pub(super) fn source_elevation_range(map: &HeightMap) -> [f64;2] {
     if let Some([low,high])=map.source_elevation_range {return [low,(high-low).max(0.)];}
     // Images supply relative brightness, not physical elevation. Use a stable
     // 0..100 range independent of preview dimensions and legacy world scale.
     [100.*f64::from(map.display_range[0]),100.*f64::from(map.display_range[1]-map.display_range[0])]
 }
+fn numeric_height(map: &HeightMap) -> bool {
+    map.source_elevation_range.is_some() && map.source.as_ref().and_then(|source|source.path.extension())
+        .and_then(|extension|extension.to_str()).is_some_and(|extension|extension.eq_ignore_ascii_case("tif")||extension.eq_ignore_ascii_case("tiff"))
+}
 fn contour_levels([bottom,span]: [f64;2],interval: f32,major_every: u32) -> [f32;2] {
     let interval=f64::from(interval);
     [(bottom/interval).rem_euclid(f64::from(major_every)) as f32,(span/interval) as f32]
 }
+fn validate_camera_frame(p: &RenderParams) -> Result<(),String> {
+    if [p.camera_frame_x,p.camera_frame_y].iter().any(|v| !v.is_finite() || v.abs()>10000.) {
+        return Err("取景偏移超出有效范围".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_contour_parameters(p: &RenderParams) -> Result<(),String> {
     for (value,low,high) in [(p.contour_interval,0.01,1e6),(p.contour_width,0.1,30.),
         (p.contour_major_width,0.1,30.),(p.contour_opacity,0.,100.),(p.contour_smoothing,0.,5.)] {
@@ -1887,10 +2338,10 @@ pub(crate) fn validate_contour_parameters(p: &RenderParams) -> Result<(),String>
     Ok(())
 }
 fn needs_surface(p: &RenderParams) -> bool {
-    p.stretch_type!="none" || elevation_color_blend(p) || p.appearance_mode=="texture" || p.contour_enabled
+    p.stretch_type!="none" || elevation_color_blend(p) || texture_enabled(p) || p.contour_enabled || p.appearance_pick || p.cloud_enabled || p.water_enabled
 }
 fn needs_export_pass(p: &RenderParams, georeferenced: bool) -> bool {
-    !output_is_neutral(p) || (georeferenced && p.export_shadow)
+    !output_is_neutral(p) || p.cloud_enabled || p.water_enabled || (georeferenced && p.export_shadow)
 }
 fn output_is_neutral(p: &RenderParams) -> bool {
     p.exposure==1. && p.gamma==2.2 && output_adjustments(p).iter().all(|v| *v==0.)
@@ -1917,10 +2368,11 @@ fn validate_display_parameters(p: &RenderParams) -> Result<(),String> {
     }
     Ok(())
 }
+fn cloud_post_source()->String{include_str!("cloud_post.glsl").replace("// WATER_DISPLAY",include_str!("water_post.glsl"))}
 fn stretch_post_source() -> String {
     include_str!("stretch_display.glsl")
-        .replace("void main(){",&format!("{}\nuniform int output_filter_enabled, export_shadow_matte;\nvoid main(){{",include_str!("output_filter.glsl")))
-        .replace("gl_FragColor=color;","if(output_filter_enabled!=0){vec3 incoming=color.rgb;color.rgb=output_filter(color.rgb);if(export_shadow_matte!=0&&all(equal(incoming,vec3(0.))))color.rgb=vec3(0.);}gl_FragColor=color;")
+        .replace("void main(){",&format!("uniform vec2 output_full_size,output_tile_origin;uniform int output_tiled;\n{}\n{}\n{}\n{}\nuniform int output_filter_enabled, export_shadow_matte;\nvoid main(){{",include_str!("output_filter.glsl"),include_str!("display_workflow.glsl"),super::cloud::HEADER,cloud_post_source()))
+        .replace("gl_FragColor=color;","color=scene_display_cloud(color,uv);if(output_filter_enabled!=0){vec3 incoming=color.rgb;color.rgb=output_filter(color.rgb);if(export_shadow_matte!=0&&all(equal(incoming,vec3(0.))))color.rgb=vec3(0.);}gl_FragColor=color;")
 }
 fn output_adjustments(p: &RenderParams) -> [f32; 5] {
     [
@@ -1942,13 +2394,14 @@ fn filter_post_source(source: String) -> String {
             &format!("{}\nuniform int export_shadow_matte, output_filter_enabled;\nvoid main(){{", include_str!("output_filter.glsl")),
         )
         .replace(
-            "gl_FragColor.rgb=scene_filter(contour_display(texture_display_overlay(gl_FragColor.rgb,uv),uv));",
-            "gl_FragColor.rgb=scene_filter(contour_display(texture_display_overlay(gl_FragColor.rgb,uv),uv));if(output_filter_enabled!=0)gl_FragColor.rgb=output_filter(gl_FragColor.rgb);if(export_shadow_matte!=0&&all(equal(texture2D(tex_accum,uv).rgb,vec3(0.))))gl_FragColor.rgb=vec3(0.);",
+            "gl_FragColor=scene_display_cloud(gl_FragColor,uv);",
+            "gl_FragColor=scene_display_cloud(gl_FragColor,uv);if(output_filter_enabled!=0)gl_FragColor.rgb=output_filter(gl_FragColor.rgb);if(export_shadow_matte!=0&&all(equal(texture2D(tex_accum,uv).rgb,vec3(0.))))gl_FragColor.rgb=vec3(0.);",
         )
 }
 
 fn elevation_post_source() -> String {
-    let palette=include_str!("appearance.glsl").split("vec3 color(float id,vec3 p)").next().unwrap();
+    let palette=super::ramp::source(include_str!("appearance.glsl"));
+    let palette=palette.split("vec3 color(float id,vec3 p)").next().unwrap();
     post_source(false).replace("void main(){",&format!("{}\n{}\nvoid main(){{",palette,include_str!("color_blend.glsl")))
         .replace("dst=clamp(dst,0.0,1.0);", "dst=clamp(dst,0.0,1.0);dst.xyz=elevation_display_blend(dst.xyz,uv);")
 }
@@ -1958,8 +2411,10 @@ fn post_source(color_mode: bool) -> String {
         original.replace("void main(){",&format!("{}\nvoid main(){{",include_str!("tonemap.glsl")))
             .replace("dst.xyz=pow(post(dst.xyz),vec3(gamma));","dst.xyz=relief_display(dst.xyz);")
     } else { original.to_owned() };
-    let source=source.replace("void main(){",&format!("{}\nvoid main(){{",include_str!("display_workflow.glsl")))
-        .replace("gl_FragColor=mix(src,dst,weight);","gl_FragColor=mix(src,dst,weight);gl_FragColor.rgb=scene_filter(contour_display(texture_display_overlay(gl_FragColor.rgb,uv),uv));");
+    let source=source.replace("void main(){",&format!("{}\n{}\nvoid main(){{",include_str!("display_workflow.glsl"),super::background::POST_HEADER.replace("TRANSITION_SKY_DISPLAY(radiance)",if color_mode {"clamp(relief_display(radiance),0.,1.)"}else{"clamp(pow(post(radiance),vec3(gamma)),0.,1.)"})))
+        .replace("dst=texture2D(tex_accum,uv);","dst=texture2D(tex_accum,uv);if((scene_background_mode!=0||scene_background_transition!=0)&&scene_background_transparent==0)dst.rgb/=max(dst.a,1e-12);")
+        .replace("gl_FragColor=mix(src,dst,weight);","gl_FragColor=mix(src,dst,weight);gl_FragColor=scene_composite_background(gl_FragColor);gl_FragColor.rgb=contour_display(texture_display_overlay(gl_FragColor.rgb,uv),uv);gl_FragColor.rgb=scene_filter(gl_FragColor.rgb);gl_FragColor=scene_display_cloud(gl_FragColor,uv);");
+    let source=source.replace("void main(){",&format!("{}\n{}\nvoid main(){{",super::cloud::HEADER,cloud_post_source()));
     format!("#version 330 compatibility\n{source}")
 }
 
@@ -1974,7 +2429,7 @@ fn color_texture_rows(texture: &ColorTexture) -> Vec<u8> {
         .collect()
 }
 
-fn parse_color(s: &str) -> Result<[f32; 3], String> {
+pub(super) fn parse_color(s: &str) -> Result<[f32; 3], String> {
     let s = s.strip_prefix('#').unwrap_or(s);
     if s.len() != 6 || !s.is_ascii() {
         return Err("颜色必须是 #RRGGBB".into());
@@ -1998,7 +2453,8 @@ fn parse_srgb_color(s: &str) -> Result<[f32; 3], String> {
 
 fn material_albedo(p: &RenderParams) -> Result<[f32; 3], String> {
     let color = parse_color(&p.material_color)?;
-    if p.appearance_mode == "elevation" {
+    if !material_enabled(p) { return parse_color("#d5d2c9"); }
+    if p.appearance_layers_version == 0 && elevation_enabled(p) {
         return Ok(color);
     }
     let base = parse_color("#d5d2c9")?;
@@ -2013,6 +2469,7 @@ fn material_albedo(p: &RenderParams) -> Result<[f32; 3], String> {
 }
 
 fn appearance_opacity(p: &RenderParams) -> f32 {
+    if p.appearance_layers_version >= 1 { return (p.elevation_opacity / 100.).clamp(0.,1.); }
     (match p.appearance_mode.as_str() {
         "texture" => p.texture_opacity,
         "elevation" => p.elevation_opacity,
@@ -2021,9 +2478,13 @@ fn appearance_opacity(p: &RenderParams) -> f32 {
         .clamp(0., 1.)
 }
 
-fn elevation_color_blend(p: &RenderParams) -> bool { p.appearance_mode == "elevation" && p.elevation_blend == "color" }
+fn material_enabled(p: &RenderParams) -> bool { p.appearance_layers_version == 0 || p.material_enabled }
+fn material_specular_enabled(p: &RenderParams) -> bool { if p.appearance_layers_version >= 1 {p.material_enabled} else {p.appearance_mode == "material"} }
+fn elevation_enabled(p: &RenderParams) -> bool { if p.appearance_layers_version >= 1 {p.elevation_enabled} else {p.appearance_mode == "elevation"} }
+fn texture_enabled(p: &RenderParams) -> bool { if p.appearance_layers_version >= 1 {p.texture_enabled} else {p.appearance_mode == "texture"} }
+fn elevation_color_blend(p: &RenderParams) -> bool { elevation_enabled(p) && p.elevation_blend == "color" }
 fn uses_color_display(p: &RenderParams) -> bool {
-    p.appearance_mode == "elevation" && !elevation_color_blend(p)
+    elevation_enabled(p) && !elevation_color_blend(p)
 }
 // Decoders and ASC use top-to-bottom rows; the terrain uses +Y toward
 // the image's top. Convert once for both viewport and export rendering.
@@ -2085,14 +2546,40 @@ fn camera_basis(yaw: f32, pitch: f32) -> [f32; 9] {
     let (sp, cp) = pitch.sin_cos();
     [-sy, cy, 0., -sp * cy, -sp * sy, cp, cy * cp, sy * cp, sp]
 }
+pub(super) fn background_gradient_axis(p:&RenderParams,full:[f32;2])->[f32;2] {
+    if !p.background_follow_light {
+        let angle=p.background_angle.to_radians();
+        return [angle.cos(),-angle.sin()];
+    }
+    projected_light_axis(p,full)
+}
+fn projected_light_axis(p:&RenderParams,full:[f32;2])->[f32;2] {
+    let az=p.sun_azimuth.to_radians();let alt=p.sun_altitude.to_radians();
+    let sun=[alt.cos()*az.cos(),alt.cos()*az.sin(),alt.sin()];
+    let pitch=if p.projection=="isometric"{35.26439}else{p.camera_pitch.clamp(0.,90.)};
+    let basis=camera_basis(p.camera_yaw.to_radians(),pitch.to_radians());
+    let dot=|offset:usize| (0..3).map(|i|basis[offset+i]*sun[i]).sum::<f32>();
+    // Color 1 is the light-facing endpoint. Account for pixel aspect before
+    // evaluating the gradient in normalized full-frame coordinates.
+    let dx=dot(0);let dy=dot(3);
+    if dx.hypot(dy)<1e-6 {return [0.,0.];}
+    let x=-dx*full[0];let y=-dy*full[1];
+    let length=x.hypot(y);
+    if length<1e-4 {return [0.,0.];}
+    [x/length,y/length]
+}
 fn bytes(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
-
-
-
-
-
-
-
+fn validate_height_texture(map: &HeightMap) -> Result<(), String> {
+    // The display geometry uses dimensions * 0.2, not the legacy physical
+    // f32 span. A valid f64 DEM can overflow/underflow that unused field.
+    if map.width < 2 || map.height < 2
+        || (map.width as usize).checked_mul(map.height as usize) != Some(map.values.len())
+        || map.values.iter().any(|v| !v.is_finite() || !(0. ..=1.).contains(v))
+    {
+        return Err("无效的归一化高度图".into());
+    }
+    Ok(())
+}

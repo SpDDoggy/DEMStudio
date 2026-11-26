@@ -1,0 +1,21 @@
+.app-context-root[hidden] { display: none !important; }
+.app-context-root { display: contents; }
+.app-context-menu {
+  position: fixed; z-index: 10000; box-sizing: border-box; min-width: min(190px, calc(100vw - 16px)); padding: 5px;
+  overflow: auto; pointer-events: auto; color: #e7edf4;
+  background: #29313d; border: 1px solid #546173; border-radius: 10px;
+  box-shadow: 0 8px 28px #0006; font-family: inherit; font-size: 12px; line-height: 1.4;
+}
+.app-context-item {
+  display: flex; align-items: center; gap: 8px; width: 100%; min-height: 30px;
+  padding: 5px 7px; border: 0; border-radius: 6px; margin: 0;
+  background: transparent; color: inherit; font: inherit; text-align: left;
+  cursor: default; outline: none; white-space: nowrap;
+}
+.app-context-item:hover:not([aria-disabled="true"]), .app-context-item:focus-visible { background: #405573; }
+.app-context-item[aria-disabled="true"] { color: #8b95a3; }
+.app-context-mark { width: 12px; flex: 0 0 12px; color: #a5c9ff; }
+.app-context-label { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.app-context-shortcut { padding-left: 16px; color: #a7b4c6; font-size: 11px; }
+.app-context-arrow { width: 8px; text-align: right; font-size: 17px; line-height: 1; }
+.app-context-separator { height: 1px; margin: 4px 7px; background: #ffffff1c; }

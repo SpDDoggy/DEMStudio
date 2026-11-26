@@ -1,11 +1,16 @@
 //! Full path continuation for the currently enabled DEMStudio lighting model.
 //! Not wired into the renderer until native output equivalence is verified.
 pub(super) const STATE_LAYERS: u32 = 19;
+// Shared immutable-primary producer contract used by all derived generators.
+pub(super) const PRIMARY_LOCAL: &str = "if(bounce==0){pg_s[17]=pg_s[3];pg_s[18]=vec4(pg_s[4].xy,o.z,dir.z);}";
+pub(super) const PRIMARY_PRODUCER: &str = "if(bounce==0){pg_s[17]=pg_s[3];pg_s[18]=vec4(pg_s[4].xy,o.z,dir.z);imageStore(rs_state_image,ivec3(ivec2(gl_FragCoord.xy),17),pg_s[17]);imageStore(rs_state_image,ivec3(ivec2(gl_FragCoord.xy),18),pg_s[18]);}";
+pub(super) const FOG_PRIMARY_LOAD: &str = "if(resume&&scene_fog_density>0.){\n        pg_s[17]=imageLoad(rs_state_image,ivec3(coord,17));\n        pg_s[18]=imageLoad(rs_state_image,ivec3(coord,18));\n    }";
+
 pub(super) fn compute_batch_enabled()->bool {
     cfg!(test)&&std::env::var("DEMSTUDIO_DIAGNOSTIC_COMPUTE_BATCH").as_deref()==Ok("on")
 }
 pub(super) fn compute_group_size()->u32 {
-    
+
     256
 }
 include!("phase_shader.rs");
@@ -15,6 +20,7 @@ include!("async_shader.rs");
 pub(super) const INTERPOLATED_ST_FRAGMENT: &str = "#version 330 compatibility\nin vec2 st;layout(location=0) out vec4 rs_st;void main(){rs_st=vec4(st,0.,0.);}";
 pub(super) const IMAGE_QUEUE_VERTEX: &str = r#"#version 330 compatibility
 #extension GL_ARB_shader_storage_buffer_object : require
+#extension GL_ARB_shader_image_load_store : require
 layout(std430,binding=1) readonly buffer ActiveQueue { uint words[]; };
 uniform int rs_use_point_queue;
 uniform ivec2 aq_extent;
@@ -36,8 +42,14 @@ void main(){
 }"#;
 
 pub(super) fn source_with_mrt(dense: &str, wide: bool) -> Result<String, String> {
+    source_with_mrt_policy(dense,wide,crate::renderer::source_export_policy::SourceExportPolicy::legacy())
+}
+fn source_with_mrt_policy(dense:&str,wide:bool,policy:crate::renderer::source_export_policy::SourceExportPolicy)->Result<String,String>{
     for unsupported in ["OPT_FOG", "OPT_AREA", "OPT_IBL", "OPT_BG_A", "OPT_BG_C", "OPT_HOR", "OPT_LE", "OPT_DOF", "OPT_SPIN"] {
-        if dense.lines().any(|line| line.trim_start().starts_with(&format!("#define {unsupported}"))) {
+        if dense.lines().any(|line| {
+            let mut tokens=line.split_whitespace();
+            tokens.next()==Some("#define")&&tokens.next()==Some(unsupported)
+        }) {
             return Err(format!("RayState 尚未覆盖已启用宏 {unsupported}"));
         }
     }
@@ -49,7 +61,7 @@ pub(super) fn source_with_mrt(dense: &str, wide: bool) -> Result<String, String>
         if !dense.contains("#define PRIM_BICUBIC"){return Err("BicubicPatchGather仅支持Bicubic".into());}
         shader=shader.replacen("#version 330 compatibility","#version 330 compatibility\n#extension GL_ARB_texture_gather : require\n#extension GL_ARB_gpu_shader5 : require\n#define BC_PATCH_GATHER",1);
     }
-    if std::env::var("DEMSTUDIO_BILINEAR_LEAF_GATHER").as_deref()==Ok("on"){
+    if policy.leaf_gather{
         if !dense.lines().any(|line|line.trim()=="#define PRIM_SURF"){return Err("LeafGather仅支持Bilinear".into());}
         shader=shader.replacen("#version 330 compatibility","#version 330 compatibility\n#extension GL_ARB_texture_gather : require\n#extension GL_ARB_gpu_shader5 : require\n#define PG_BILINEAR_LEAF_GATHER",1);
     }
@@ -69,7 +81,7 @@ pub(super) fn source_with_mrt(dense: &str, wide: bool) -> Result<String, String>
     if std::env::var("DEMSTUDIO_BICUBIC_LEAF_BOUNDS").as_deref()==Ok("on")&&dense.contains("#define PRIM_BICUBIC") {
         shader=shader.replacen("#version 330 compatibility","#version 330 compatibility\n#define BC_LEAF_BOUND_TEX",1);
     }
-    if crate::renderer::tight_bounds::enabled("bilinear")&&dense.lines().any(|line|line.trim()=="#define PRIM_SURF") {
+    if policy.tight_bounds&&dense.lines().any(|line|line.trim()=="#define PRIM_SURF") {
         shader=shader.replacen("#version 330 compatibility","#version 330 compatibility\n#define PG_TIGHT_BOUNDS",1);
     }
     if std::env::var("DEMSTUDIO_TERMINAL_VISIBILITY").as_deref()==Ok("on")
@@ -90,11 +102,11 @@ pub(super) fn source_with_mrt(dense: &str, wide: bool) -> Result<String, String>
     shader = replace_function(&shader, "float shadow(", "float shadow(vec3 o,vec3 dir,float d){return 1.;}")?;
     shader = shader.replace("void main(void)", "void rs_unused_original_main(void)").replace("gl_FragColor", "pg_radiance");
     if dense.contains("uniform vec2 geo_source_size;") { shader.push_str("\n#define RS_GEO\n"); }
-    if dense.contains("vec4 catch_shadow(") { shader.push_str("\n#define RS_MATTE\n"); }
+    if dense.contains("vec4 catch_shadow(") || dense.contains("#define LAYOUT_SHADOW_ONLY") { shader.push_str("\n#define RS_MATTE\n"); }
     shader.push_str(include_str!("raystate_main.glsl"));
-    
-    
-    
+
+
+
     Ok(shader)
 }
 
@@ -108,7 +120,7 @@ pub(super) fn source_compute(dense: &str) -> Result<String, String> {
     shader = shader.replacen("#version 330 compatibility", &format!("#version 430 compatibility\n{}", include_str!("raystate_compute_header.glsl")), 1);
     shader = shader.replace("gl_FragCoord.xy", "rs_fragcoord");
     shader = shader.replace("varying vec2 st;", "vec2 st;");
-    
+
     // Fragment outputs do not exist in a compute stage. All 19 state layers
     // are written directly once; there are no bank re-executions or copies.
     for index in 0..7 {
@@ -139,16 +151,26 @@ pub(super) fn source_compute(dense: &str) -> Result<String, String> {
 /// One raster invocation stores the entire continuation state. Keep the
 /// original language version and raster stage for interpolation and arithmetic.
 pub(super) fn source_image_fragment(dense: &str) -> Result<String, String> {
-    source_image_fragment_impl(dense,true)
+    source_image_fragment_impl(dense,true,legacy_image_policy(dense)?)
+}
+pub(super) fn source_image_fragment_with_policy(dense:&str,policy:crate::renderer::source_export_policy::SourceExportPolicy)->Result<String,String>{
+    source_image_fragment_impl(dense,true,policy)
 }
 
-fn source_image_fragment_impl(dense:&str,root_transport:bool)->Result<String,String>{
+fn legacy_image_policy(dense:&str)->Result<crate::renderer::source_export_policy::SourceExportPolicy,String>{
+    if dense.contains("#define PRIM_SURF\n"){crate::renderer::source_export_policy::SourceExportPolicy::legacy_image()}
+    else{Ok(crate::renderer::source_export_policy::SourceExportPolicy::legacy())}
+}
+fn source_image_fragment_impl(dense:&str,root_transport:bool,policy:crate::renderer::source_export_policy::SourceExportPolicy)->Result<String,String>{
     #[cfg(not(test))] let _=root_transport;
-    let mut shader = source_with_mrt(dense, false)?;
-    
+    let mut shader = source_with_mrt_policy(dense, false,policy)?;
+    if policy.tight_descent {
+        inject_tight_descent(&mut shader,dense,policy.tight_bounds)?;
+    }
+
     // Counterfactual cost bound only: absent from application builds. This
     // changes radiance, so its output can never qualify as a renderer candidate.
-    
+
     if std::env::var("DEMSTUDIO_VISIBILITY_PROBE").as_deref()==Ok("on"){
         inject_visibility_diagnostic(&mut shader)?;
     }
@@ -163,8 +185,7 @@ fn source_image_fragment_impl(dense:&str,root_transport:bool)->Result<String,Str
     }
     // The immutable primary hit is consumed only by the host's first-sample
     // memo copy. Store it once at its producer, outside the mutable path state.
-    shader=shader.replace("if(bounce==0){pg_s[17]=pg_s[3];pg_s[18]=pg_s[4];}",
-        "if(bounce==0){imageStore(rs_state_image,ivec3(ivec2(gl_FragCoord.xy),17),pg_s[3]);imageStore(rs_state_image,ivec3(ivec2(gl_FragCoord.xy),18),pg_s[4]);}");
+    shader=shader.replace(PRIMARY_LOCAL,PRIMARY_PRODUCER);
     // A full state dump is a diagnostic contract, including retired path layers.
     // Production consumers of DONE paths read status 5 and radiance 6 only.
     let full_state_diagnostic=cfg!(test)&&(std::env::var_os("DEMSTUDIO_STATE_DUMP").is_some()
@@ -176,7 +197,7 @@ fn source_image_fragment_impl(dense:&str,root_transport:bool)->Result<String,Str
     let debug_camera=cfg!(test)&&(std::env::var_os("DEMSTUDIO_TRACE_INITIAL_RAY").is_some()
         ||std::env::var_os("DEMSTUDIO_TRACE_CAMERA_INPUT").is_some()
         ||std::env::var_os("DEMSTUDIO_TRACE_BICUBIC_PATCH").is_some());
-    shader.push_str(if dense.contains("vec4 catch_shadow(")||debug_camera {"\n#define RS_MUTABLE_LAYERS 17\n"}else{"\n#define RS_MUTABLE_LAYERS 15\n"});
+    shader.push_str(if dense.contains("vec4 catch_shadow(")||dense.contains("#define LAYOUT_SHADOW_ONLY")||debug_camera {"\n#define RS_MUTABLE_LAYERS 17\n"}else{"\n#define RS_MUTABLE_LAYERS 15\n"});
     shader=shader.replacen("#extension GL_ARB_shader_image_load_store : require","#extension GL_ARB_shader_storage_buffer_object : require\n#extension GL_ARB_shader_image_load_store : require",1);
     shader=shader.replace("void rs_run(){",&format!("{}\nvoid rs_run(){{",crate::renderer::gpu_batch::FRAGMENT_HEADER));
     shader=shader.replace("if(pg_resume==0){","if(!rs_batch_resume()){");
@@ -186,9 +207,12 @@ fn source_image_fragment_impl(dense:&str,root_transport:bool)->Result<String,Str
     // fused further. Keep its verified boundary; only bilinear passed the full
     // 256-sample byte comparison for the larger local phase budget.
     if dense.contains("#define PRIM_SURF\n") {shader=shader.replace("transitions<8","transitions<32");}
+    if dense.contains("#define PRIM_SURF\n") {
+        apply_bilinear_phase_limit(&mut shader,true,Some(&policy.phase_limit.to_string()))?;
+    }
     // Explicit test only: measure phase scheduling grain without changing any
     // traversal quantum, path arithmetic, state layout or commit order.
-    
+
     let profile=crate::renderer::bicubic_profile::enabled()&&dense.contains("#define PRIM_BICUBIC");
     if profile {
         // The header must precede bicubic.glsl's conditional local counters.
@@ -196,17 +220,46 @@ fn source_image_fragment_impl(dense:&str,root_transport:bool)->Result<String,Str
         shader.insert_str(insertion,crate::renderer::bicubic_profile::SHADER_HEADER);
         shader.push_str(&include_str!("raystate_image_main.glsl").replace("rs_run();","rs_run();bc_profile_flush();"));
     }else{shader.push_str(include_str!("raystate_image_main.glsl"));}
-    
-    
-    
+
+
+
     if std::env::var("DEMSTUDIO_IMAGE_STATIC_STATE").as_deref()==Ok("on") {shader=expand_async_state_loops(&shader)?;}
+
+
     Ok(shader)
+}
+
+fn inject_tight_descent(shader:&mut String,dense:&str,tight_enabled:bool)->Result<(),String>{
+    if !tight_enabled||!dense.lines().any(|line|line.trim()=="#define PRIM_SURF")
+        ||!dense.contains("uniform vec2 geo_source_size;"){
+        return Err("TightDescent requires Geo Bilinear and DEMSTUDIO_TIGHT_BOUNDS=on".into());
+    }
+    let marker="#version 330 compatibility";
+    if shader.matches(marker).count()!=1{return Err("TightDescent shader version boundary changed".into());}
+    *shader=shader.replacen(marker,&format!("{marker}\n#define PG_TIGHT_BOUNDS_DESCENT"),1);
+    Ok(())
+}
+
+fn apply_bilinear_phase_limit(shader:&mut String,bilinear:bool,value:Option<&str>)->Result<(),String>{
+    if !bilinear{return Ok(());}
+    if let Some(value)=value {
+        let limit=value.parse::<u32>().map_err(|_|"invalid Bilinear phase limit")?;
+        if !matches!(limit,32|64|128){return Err("invalid Bilinear phase limit".into());}
+        if shader.matches("transitions<32").count()!=1{return Err("Bilinear phase loop boundary changed".into());}
+        *shader=shader.replacen("transitions<32",&format!("transitions<{limit}"),1);
+    }
+    Ok(())
 }
 
 fn inject_visibility_diagnostic(shader:&mut String)->Result<(),String>{
     let at=shader.find("bool pg_walk(").ok_or("可见性诊断缺少遍历入口")?;
     shader.insert_str(at,&crate::renderer::visibility_diagnostic::shader_header());Ok(())
 }
+
+
+
+
+
 
 fn done_store_header(minimal:bool)->&'static str {
     if minimal {"\n#define RS_DONE_MINIMAL_STORE\n"}else{""}
@@ -222,13 +275,3 @@ fn replace_function(source: &str, signature: &str, replacement: &str) -> Result<
     }
     Err("RayState 函数括号不完整".into())
 }
-
-
-
-
-
-
-
-
-
-

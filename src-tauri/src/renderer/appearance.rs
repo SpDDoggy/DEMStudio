@@ -8,6 +8,9 @@ const MAX_EDGE: u32 = 16_384;
 const PREVIEW_EDGE: u32 = 4_096;
 const DECODE_BUDGET: u64 = 1024 * 1024 * 1024;
 
+#[path = "appearance_shader.rs"]
+pub(super) mod shader;
+
 #[derive(Clone, Debug)]
 pub struct ColorTexture {
     pub width: u32,
@@ -141,5 +144,3 @@ fn jpeg(path: &Path) -> Result<DynamicImage, String> {
             .ok_or("JPEG 像素数量与尺寸不一致")?,
     ))
 }
-
-

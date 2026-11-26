@@ -118,5 +118,3 @@ impl SlotPool {
         self.slots.iter().filter(|s|s.phase==Phase::Ready).map(|s|s.page).collect()
     }
 }
-
-

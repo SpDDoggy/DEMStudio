@@ -403,5 +403,3 @@ where
     image.finish().map_err(|e| e.to_string())?;
     Ok(())
 }
-
-

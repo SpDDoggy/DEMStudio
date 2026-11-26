@@ -1,6 +1,6 @@
 export const stretchKeys = ['stretchType', 'stretchDeviations', 'stretchLow', 'stretchHigh'];
 
-export const exportKeys = new Set(['width', 'height', 'samples', 'outputBitDepth', 'exportTerrainScale', 'exposure', 'gamma',
+export const exportKeys = new Set(['exportNormal', 'exportDepth', 'exportShadowLayer', 'exportTransparent', 'width', 'height', 'samples', 'outputBitDepth', 'exportTerrainScale', 'exposure', 'gamma',
   'exportOrthographic', 'exportGeoreference', 'outputContrast', 'outputSaturation', 'outputTemperature', 'outputShadows', 'outputHighlights', 'exportShadow', 'shadowPadding']);
 
 export function createExportSettings(parameters) {
@@ -8,14 +8,16 @@ export function createExportSettings(parameters) {
 }
 
 export function exportSnapshot(parameters, settings) {
-  return cloneScene({ ...parameters, ...settings, grid: false, contourEnabled: false,
+  return cloneScene({ ...parameters, ...settings, appearancePick: false, grid: false, contourEnabled: false,
     exposure: 1, gamma: 2.2, outputContrast: 0, outputSaturation: 0,
     outputTemperature: 0, outputShadows: 0, outputHighlights: 0 });
 }
 
 // Source framing and geographic metadata are independent of file encoding.
-export function exportRequest(parameters, settings) {
+export function exportRequest(parameters, settings, format = 'png') {
   const params = exportSnapshot(parameters, settings);
+  if (['jpeg','bmp','tga'].includes(format)) params.outputBitDepth = 8;
+  if (['jpeg','bmp'].includes(format)) params.exportTransparent = false;
   params.exportShadow = params.exportOrthographic && params.exportShadow;
   params.exportGeoreference = params.exportOrthographic && params.exportGeoreference;
   return { orthographic: params.exportOrthographic, params };
@@ -84,13 +86,22 @@ export function cloneScene(value) {
 }
 
 // Preserve the camera frustum after native cover presentation crops the output.
-export function freezeCurrentView(parameters, viewport) {
+export function freezeCurrentView(parameters, viewport, crop = null) {
   const snapshot=cloneScene(parameters);
   const {width,height}=viewport;
   if (!(width>0 && height>0 && parameters.width>0 && parameters.height>0)) throw new Error('视口尺寸无效');
   const coverScale=Math.max(width/parameters.width,height/parameters.height);
   const k=Math.min(width,height)/(Math.min(parameters.width,parameters.height)*coverScale);
   snapshot.fieldOfView=2*Math.atan(Math.tan(parameters.fieldOfView*Math.PI/360)*k)*180/Math.PI;
+  if (parameters.cameraFrameX !== undefined) snapshot.cameraFrameX=parameters.cameraFrameX/k;
+  if (parameters.cameraFrameY !== undefined) snapshot.cameraFrameY=parameters.cameraFrameY/k;
+  if (crop) {
+    if (!['x','y','width','height'].every(key=>Number.isFinite(crop[key])) || crop.x<0 || crop.y<0 || crop.width<=0 || crop.height<=0 || crop.x+crop.width>1.000001 || crop.y+crop.height>1.000001) throw new Error('取景范围无效');
+    const w=crop.width*width,h=crop.height*height,m=Math.min(w,h),M=Math.min(width,height);
+    snapshot.fieldOfView=2*Math.atan(Math.tan(snapshot.fieldOfView*Math.PI/360)*m/M)*180/Math.PI;
+    snapshot.cameraFrameX=((snapshot.cameraFrameX??0)*M+2*crop.x*width+w-width)/m;
+    snapshot.cameraFrameY=((snapshot.cameraFrameY??0)*M+height-2*crop.y*height-h)/m;
+  }
   return snapshot;
 }
 

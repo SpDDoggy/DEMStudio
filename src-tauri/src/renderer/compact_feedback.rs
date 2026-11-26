@@ -173,7 +173,3 @@ fn decode(words: &[u32]) -> Feedback {
     Feedback { done: words[0], current_done: words[1], yielded: words[2],
         invalid: words[3], total: words[4], waiting: words[5], active: words[6], requests }
 }
-
-
-
-

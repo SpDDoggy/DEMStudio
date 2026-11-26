@@ -116,4 +116,3 @@ pub fn parse_asc(text: &str, name: String) -> Result<HeightMap, String> {
     }
     normalize(w, h, data, cell, name)
 }
-

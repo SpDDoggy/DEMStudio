@@ -140,8 +140,15 @@ bool pg_walk(vec3 o,vec3 dir,vec2 interval,bool visibility,
 #endif
 #ifdef PG_TIGHT_BOUNDS
         bool tight_empty=false;
+#ifdef PG_TIGHT_BOUNDS_DESCENT
+        float tight_h=0.,tight_margin=0.;bool tight_descent_valid=false;
+#endif
         if(lod>=1.&&mipmap_size.z>=0.){
+#ifdef PG_TIGHT_BOUNDS_DESCENT
+            tight_h=pg_tight_raw(i_cell,lod)*mipmap_size.z;
+#else
             float tight_h=pg_tight_raw(i_cell,lod)*mipmap_size.z;
+#endif
 #ifdef OPT_LEVEL
             tight_h=ceil(tight_h/mipmap_step)*mipmap_step;
 #endif
@@ -150,8 +157,23 @@ bool pg_walk(vec3 o,vec3 dir,vec2 interval,bool visibility,
             // whenever the segment is close to the mathematical upper bound.
             float margin=max(1e-5,max(max(abs(z0),abs(z1)),abs(tight_h))*7.62939453125e-6);
             tight_empty=min(z0,z1)>tight_h+margin;
+#ifdef PG_TIGHT_BOUNDS_DESCENT
+            tight_margin=margin;
+            tight_descent_valid=!isnan(tight_h)&&!isinf(tight_h)
+                &&!isnan(mipmap_size.z)&&!isinf(mipmap_size.z)
+                &&!isnan(mipmap_size.w)&&!isinf(mipmap_size.w);
+#ifdef OPT_LEVEL
+            tight_descent_valid=tight_descent_valid&&mipmap_step>0.&&!isnan(mipmap_step)&&!isinf(mipmap_step);
+#endif
+#endif
         }
         if(!tight_empty){
+#ifdef PG_TIGHT_BOUNDS_DESCENT
+        // Geo's four-corner mip envelope contains the tight closed support.
+        // Certify only its original z0<=h descent; never replace the height
+        // used to advance e.x or change the leaf intersection interval.
+        if(tight_descent_valid&&lod>mipmap_lod.x&&tight_h>0.&&z0<=tight_h-tight_margin){lod-=1.;continue;}
+#endif
 #endif
 #if !defined(PRIM_CUBE)
         if(lod<=mipmap_lod.x){

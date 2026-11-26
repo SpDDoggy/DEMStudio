@@ -96,4 +96,3 @@ fn decode(bytes:&[u8;COUNTER_BYTES])->serde_json::Value{
             "interrupted":{"clear":read(10),"occluded":read(11),"unknown":read(12)}});
     }result
 }
-

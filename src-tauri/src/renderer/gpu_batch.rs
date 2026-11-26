@@ -133,7 +133,3 @@ impl GpuBatch {
     }
     pub unsafe fn destroy(self,gl:&glow::Context){gl.bind_buffer_base(glow::SHADER_STORAGE_BUFFER,2,None);gl.delete_buffer(self.buffer);gl.delete_program(self.program);}
 }
-
-
-
-

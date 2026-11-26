@@ -24,6 +24,8 @@ pub(super) struct Brick {
 pub(super) struct PagedSource {
     source: SourceGrid,
     pub factor: u32,
+    refinement: u32,
+    scan_started: bool,
     pub logical_size: [u32; 2],
     pub padded_size: u32,
     /// GEO_HEIGHT_SAMPLER shifts world lookup by one before clamping. This is
@@ -31,8 +33,10 @@ pub(super) struct PagedSource {
     pub geo_halo: u32,
     curve: f32,
     resident_budget: usize,
+    refined_base: Option<Vec<f32>>,
     resident: Option<std::sync::Arc<Vec<f32>>>,
     tight_coarse: Option<Vec<MipLevel>>,
+    collect_tight_bounds: bool,
     visibility_coarse: Option<Vec<super::visibility_bounds::BoundsLevel>>,
 }
 fn valid(m: &SourceMetadata, v: f64) -> bool {
@@ -207,17 +211,32 @@ impl PagedSource {
         Ok(Self {
             source,
             factor,
+            refinement: 1,
+            scan_started: false,
             logical_size,
             padded_size,
             geo_halo,
             curve,
             resident_budget: 0,
+            refined_base: None,
             resident: None,
             tight_coarse: None,
+            collect_tight_bounds: super::source_export_policy::SourceExportPolicy::legacy().tight_bounds,
             visibility_coarse: None,
         })
     }
+    pub fn set_refinement(&mut self, refinement: u32) -> Result<(), String> {
+        if !matches!(refinement,1|2) || self.scan_started || self.resident.is_some() || self.tight_coarse.is_some() || self.visibility_coarse.is_some() {
+            return Err("高度场细化必须在扫描前设置".into());
+        }
+        let size=[self.source.metadata.width.div_ceil(self.factor),self.source.metadata.height.div_ceil(self.factor)];
+        self.logical_size=[size[0].checked_mul(refinement).ok_or("细化尺寸溢出")?,size[1].checked_mul(refinement).ok_or("细化尺寸溢出")?];
+        self.padded_size=self.logical_size[0].max(self.logical_size[1]).checked_next_power_of_two().ok_or("细化尺寸溢出")?.max(32);
+        self.refinement=refinement;Ok(())
+    }
+    pub fn refinement(&self)->u32{self.refinement}
     pub fn set_resident_budget(&mut self, bytes: usize) { self.resident_budget = bytes; }
+    pub fn set_tight_bounds(&mut self, enabled:bool) { self.collect_tight_bounds=enabled; }
     pub fn resident_samples(&self) -> Option<std::sync::Arc<Vec<f32>>> { self.resident.clone() }
     pub fn restore_resident(&mut self, samples: Option<std::sync::Arc<Vec<f32>>>) {
         self.resident = samples;
@@ -251,6 +270,35 @@ impl PagedSource {
                 out[row*width as usize..(row+1)*width as usize]
                     .copy_from_slice(&data[start..start+width as usize]);
             }
+            return Ok(out);
+        }
+        if self.refinement==2 {
+            let smooth=super::bilinear_refine::bspline_enabled();
+            let size=[self.source.metadata.width.div_ceil(self.factor),self.source.metadata.height.div_ceil(self.factor)];
+            let lo=|i:u32| (((i as f64+0.5)*0.5-0.5).floor() as i64-1).max(0) as u32;
+            let hi=|i:u32,n:u32| ((((i as f64+0.5)*0.5-0.5).floor() as i64+2).max(0) as u32).min(n-1);
+            let left=lo(x);let top=lo(y);let right=hi(x+width-1,size[0]);let bottom=hi(y+height-1,size[1]);
+            let bw=right-left+1;let values=self.base_rect(left,top,bw,bottom-top+1)?;
+            let mut out=vec![0.;(width*height) as usize];
+            for row in 0..height {
+                let py=(y+row) as f32*0.5-0.25;let iy=py.floor() as i64;let ty=py-py.floor();
+                for col in 0..width {
+                    let px=(x+col) as f32*0.5-0.25;let ix=px.floor() as i64;let tx=px-px.floor();let mut patch=[[0.;4];4];
+                    for j in 0..4 {let sy=(iy+j as i64-1).clamp(0,i64::from(size[1])-1) as u32;
+                        for i in 0..4 {let sx=(ix+i as i64-1).clamp(0,i64::from(size[0])-1) as u32;patch[j][i]=values[((sy-top)*bw+sx-left) as usize];}
+                    }
+                    out[(row*width+col) as usize]=super::bilinear_refine::patch_with_basis(patch,tx,ty,smooth);
+                }
+            }
+            return Ok(out);
+        }
+        self.base_rect(x,y,width,height)
+    }
+    fn base_rect(&mut self,x:u32,y:u32,width:u32,height:u32)->Result<Vec<f32>,String> {
+        if let Some(base)=&self.refined_base {
+            let stride=self.source.metadata.width.div_ceil(self.factor) as usize;
+            let mut out=Vec::with_capacity((width*height) as usize);
+            for row in y..y+height {let start=row as usize*stride+x as usize;out.extend_from_slice(&base[start..start+width as usize]);}
             return Ok(out);
         }
         let f = self.factor;
@@ -353,13 +401,15 @@ impl PagedSource {
         &mut self,
         mut progress: impl FnMut(u64, u64) -> Result<(), String>,
     ) -> Result<Vec<MipLevel>, String> {
+        self.scan_started=true;
+        if self.refinement==2{return self.build_refined_coarse(&mut progress);}
         let m = self.source.metadata.clone();
         let [w, h] = self.logical_size;
         let f = self.factor;
         let curve = self.curve;
         let n = self.padded_size >> COARSE_LEVEL;
         let mut coarse = vec![0f32; (n * n) as usize];
-        let mut tight = if std::env::var("DEMSTUDIO_TIGHT_BOUNDS").as_deref()==Ok("on") {
+        let mut tight = if self.collect_tight_bounds {
             let padded=self.logical_size[0].max(self.logical_size[1]).checked_add(self.geo_halo*2)
                 .and_then(u32::checked_next_power_of_two).ok_or("紧层级尺寸溢出")?.max(32);
             Some(super::tight_bounds::CoarseAccumulator::new(self.logical_size,padded,self.geo_halo)?)
@@ -445,6 +495,58 @@ impl PagedSource {
         }
         Ok(levels)
     }
+    fn build_refined_coarse(&mut self,progress:&mut impl FnMut(u64,u64)->Result<(),String>)->Result<Vec<MipLevel>,String>{
+        let [w,h]=self.logical_size;let n=self.padded_size>>COARSE_LEVEL;let mut coarse=vec![0.;(n*n) as usize];
+        let padded=w.max(h).checked_add(self.geo_halo*2).and_then(u32::checked_next_power_of_two).ok_or("细化层级尺寸溢出")?.max(32);
+        let mut tight=if self.collect_tight_bounds{Some(super::tight_bounds::CoarseAccumulator::new(self.logical_size,padded,self.geo_halo)?)}else{None};
+        let mut visibility=if std::env::var("DEMSTUDIO_VISIBILITY_PROBE").as_deref()==Ok("on"){Some(super::visibility_bounds::CoarseAccumulator::new(self.logical_size,padded,self.geo_halo)?)}else{None};
+        // Decode once when the normalized base fits the same bounded resident
+        // budget. Image windows otherwise each restart the PNG decoder.
+        let base_size=[self.source.metadata.width.div_ceil(self.factor),self.source.metadata.height.div_ceil(self.factor)];
+        let base_samples=(u64::from(base_size[0])*u64::from(base_size[1])) as usize;
+        let base_bytes=base_samples.checked_mul(4).unwrap_or(usize::MAX);
+        if base_bytes<=self.resident_budget && self.refined_base.is_none() {
+            let mut base=Vec::new();
+            if base.try_reserve_exact(base_samples).is_ok() {
+                base.resize(base_samples,0.);
+                let m=self.source.metadata.clone();let f=self.factor;let curve=self.curve;let bw=base_size[0];
+                let mut pending:HashMap<u32,PendingRow>=HashMap::new();
+                self.source.stream_rows(|x,y,values| {
+                    let ly=y/f;let row=pending.entry(ly).or_insert_with(||PendingRow{sums:vec![0.;bw as usize],counts:vec![0;bw as usize],seen:0});
+                    for (i,&value) in values.iter().enumerate(){let lx=(x+i as u32)/f;if valid(&m,value){row.sums[lx as usize]+=value;row.counts[lx as usize]+=1;}}
+                    row.seen+=values.len() as u64;
+                    let expected=u64::from(m.width)*u64::from(f.min(m.height-ly*f));
+                    if row.seen==expected {let row=pending.remove(&ly).unwrap();for lx in 0..bw {let count=row.counts[lx as usize];base[(ly*bw+lx) as usize]=transform(&m,if count>0{row.sums[lx as usize]/f64::from(count)}else{f64::NAN},curve);}}
+                    else if row.seen>expected{return Err("源分页扫描行重复".into());}
+                    progress(0,u64::from(w)*u64::from(h))?;Ok(())
+                })?;
+                if !pending.is_empty(){return Err("源分页扫描行不完整".into());}
+                self.refined_base=Some(base);
+            }
+        }
+        let used_base=self.refined_base.as_ref().map_or(0,|v|v.len()*4);
+        let samples=(u64::from(w)*u64::from(h)) as usize;
+        let mut resident=if samples.checked_mul(4).is_some_and(|b|b<=self.resident_budget.saturating_sub(used_base)){let mut data=Vec::new();if data.try_reserve_exact(samples).is_ok(){data.resize(samples,0.);Some(data)}else{None}}else{None};
+        let total=u64::from(w)*u64::from(h);let mut scanned=0;progress(0,total)?;
+        for y in (0..h).step_by(CORE as usize){let rh=CORE.min(h-y);
+            for x in (0..w).step_by(CORE as usize){let rw=CORE.min(w-x);let values=self.logical_rect(x,y,rw,rh)?;
+                for row in 0..rh{for col in 0..rw{let value=values[(row*rw+col) as usize];let gx=x+col;let gy=h-1-y-row;
+                    if let Some(data)=resident.as_mut(){data[((y+row)*w+gx) as usize]=value;}
+                    project_max(&mut coarse,n,gx,gy,w,h,value);
+                    if let Some(b)=tight.as_mut(){b.project_sample(gx,gy,value)?;}
+                    if let Some(b)=visibility.as_mut(){b.project_sample(gx,gy,value)?;}
+                }}
+                scanned+=u64::from(rw)*u64::from(rh);progress(scanned,total)?;
+            }
+        }
+        self.resident=resident.map(std::sync::Arc::new);
+        if self.resident.is_some(){self.refined_base=None;}
+        self.tight_coarse=tight.map(|b|b.finish()).transpose()?;self.visibility_coarse=visibility.map(|b|b.finish()).transpose()?;
+        let mut levels=vec![MipLevel{level:COARSE_LEVEL,edge:n,values:coarse}];
+        while levels.last().unwrap().edge>1{let p=levels.last().unwrap();levels.push(MipLevel{level:p.level+1,edge:p.edge/2,values:reduce(&p.values,p.edge)});}
+        Ok(levels)
+    }
+
 }
 struct PendingRow {
     sums: Vec<f64>,
@@ -475,5 +577,3 @@ fn project_max(out: &mut [f32], n: u32, x: u32, y: u32, w: u32, h: u32, value: f
         }
     }
 }
-
-

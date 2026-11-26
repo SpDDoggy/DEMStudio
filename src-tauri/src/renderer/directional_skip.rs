@@ -76,6 +76,3 @@ impl DirectionalSkip{
  pub fn bytes(&self)->u64{memory_bytes(self.padded).unwrap()}
  pub unsafe fn destroy(self,gl:&glow::Context){gl.delete_texture(self.texture);gl.delete_program(self.program);}
 }
-
-
-

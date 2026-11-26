@@ -12,8 +12,8 @@ const MAX_STRIP_BYTES: usize = 24 * 1024 * 1024;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy)]
 enum Encoding {
-    
-    
+
+
     LevelOne,
 }
 struct PendingFile(PathBuf);
@@ -41,7 +41,13 @@ pub fn write_depth<F>(
 where
     F: FnMut(u32, u32, u32, u32) -> Result<Vec<u8>, String>,
 {
-    write_depth_with_compression(path, width, height, depth, tile, Encoding::LevelOne)
+    write_depth_with_compression(path, width, height, depth, tile, Encoding::LevelOne, false)
+}
+
+/// Linear data layers must never be tagged as sRGB display colors.
+pub fn write_data_depth<F>(path:&Path,width:u32,height:u32,depth:u8,tile:F)->Result<(),String>
+where F:FnMut(u32,u32,u32,u32)->Result<Vec<u8>,String> {
+    write_depth_with_compression(path,width,height,depth,tile,Encoding::LevelOne,true)
 }
 
 
@@ -53,6 +59,7 @@ fn write_depth_with_compression<F>(
     depth: u8,
     mut tile: F,
     compression: Encoding,
+    linear_data: bool,
 ) -> Result<(), String>
 where
     F: FnMut(u32, u32, u32, u32) -> Result<Vec<u8>, String>,
@@ -92,11 +99,15 @@ where
     } else {
         png::BitDepth::Eight
     });
-    encoder.set_source_srgb(png::SrgbRenderingIntent::RelativeColorimetric);
-    encoder.set_source_gamma(png::ScaledFloat::from_scaled(45455));
+    if linear_data {
+        encoder.set_source_gamma(png::ScaledFloat::from_scaled(100000));
+    } else {
+        encoder.set_source_srgb(png::SrgbRenderingIntent::RelativeColorimetric);
+        encoder.set_source_gamma(png::ScaledFloat::from_scaled(45455));
+    }
     match compression {
-        
-        
+
+
         // Adaptive row filtering is retained. Deflate level 1 preserves all
         // RGBA bytes while avoiding the slower default level-6 search.
         Encoding::LevelOne => encoder.set_deflate_compression(png::DeflateCompression::Level(1)),
@@ -135,5 +146,3 @@ where
     fs::rename(&pending.0, path).map_err(|e| format!("完成 PNG 文件失败：{e}"))?;
     Ok(())
 }
-
-

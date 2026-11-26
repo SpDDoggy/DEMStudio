@@ -32,10 +32,16 @@ fn adapt(mut s:String,stage:u32)->Result<Sources,String>{
     // Only continuation storage uses lane-expanded coordinates. All original
     // gl_FragCoord consumers, output_pixel and actual varying st stay physical.
     replace_once(&mut s,"ivec2 coord=ivec2(gl_FragCoord.xy);","ivec2 coord=ivec2(gl_FragCoord.xy)+ivec2(0,int(sw_lane)*sw_extent.y);")?;
-    let producer="if(bounce==0){imageStore(rs_state_image,ivec3(ivec2(gl_FragCoord.xy),17),pg_s[3]);imageStore(rs_state_image,ivec3(ivec2(gl_FragCoord.xy),18),pg_s[4]);}";
+    let producer=super::raystate_shader::PRIMARY_PRODUCER;
     let world=stage==1||stage==5;
     if s.matches(producer).count()!=usize::from(world){return Err("并发样本primary producer数量变化".into());}
-    s=s.replace(producer,"");
+    s=s.replace(producer,super::raystate_shader::PRIMARY_LOCAL);
+    // Fog primary data belongs to the immutable original sample-zero image,
+    // not lane-private mutable storage (whose 17/18 layers are never written).
+    for layer in [17,18]{
+        replace_once(&mut s,&format!("pg_s[{layer}]=imageLoad(rs_state_image,ivec3(coord,{layer}));"),
+            &format!("pg_s[{layer}]=texelFetch(sw_primary_state,ivec3(ivec2(gl_FragCoord.xy),{layer}),0);"))?;
+    }
     // Shared immutable original sample-zero image. Never alias writable lane image.
     for anchor in ["pg_memo(pg_memo_a,0)","pg_memo(pg_memo_b,0)"]{if s.matches(anchor).count()!=usize::from(world){return Err("并发样本primary consumer数量变化".into());}}
     s=s.replace("pg_memo(pg_memo_a,0)","texelFetch(sw_primary_state,ivec3(ivec2(gl_FragCoord.xy),17),0)")
@@ -118,4 +124,3 @@ fn block_end(s:&str,start:usize)->Result<usize,String>{
         if bytes[i]==b'{'{depth+=1;}else if bytes[i]==b'}'{depth-=1;if depth==0{return Ok(i+1);}}i+=1;
     }Err("OTHER块括号不完整".into())
 }
-

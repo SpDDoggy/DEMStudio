@@ -24,6 +24,7 @@ pub struct SkyLut {
     /// v=0, north pole at v=1, solar azimuth zero at u=0.5.
     pub pixels: Vec<f32>,
     pub mean_rgb: [f32; 3],
+    pub follow_mean_rgb: [f32; 3],
 }
 
 impl SkyLut {
@@ -35,6 +36,7 @@ impl SkyLut {
         let mut irradiance = 0.0;
         let mut weights = 0.0;
         let mut rgb_sum = [0.; 3];
+        let mut follow_sum = [0.;3];
         for y in 0..SKY_HEIGHT {
             let theta = (1.0 - (y as f64 + 0.5) / SKY_HEIGHT as f64) * PI;
             let z = theta.cos();
@@ -50,6 +52,8 @@ impl SkyLut {
                 for channel in 0..3 {
                     pixels[at + channel] = rgb[channel] as f32;
                     rgb_sum[channel] += rgb[channel] * weight;
+                    let alignment=dir[0]*sun[0]+dir[2]*sun[2];
+                    follow_sum[channel]+=rgb[channel]*weight*(1.+0.5*alignment)/(1.+sun[2]/3.);
                 }
                 irradiance += luminance(rgb) * weight;
                 weights += weight;
@@ -64,7 +68,8 @@ impl SkyLut {
             }
         }
         let mean_rgb=std::array::from_fn(|i| (rgb_sum[i]/weights/mean) as f32);
-        Self { altitude, pixels, mean_rgb }
+        let follow_mean_rgb=std::array::from_fn(|i|(follow_sum[i]/weights/mean) as f32);
+        Self { altitude, pixels, mean_rgb, follow_mean_rgb }
     }
 }
 
@@ -158,5 +163,3 @@ fn in_scatter(dir: [f64; 3], sun: [f64; 3]) -> [f64; 3] {
 fn luminance(rgb: [f64; 3]) -> f64 {
     rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722
 }
-
-

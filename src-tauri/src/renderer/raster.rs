@@ -644,5 +644,3 @@ fn tiff_chunk_budget(w: u32, h: u32, bands: usize, bits: u8) -> Result<(), Strin
         Ok(())
     }
 }
-
-

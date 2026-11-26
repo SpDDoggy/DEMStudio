@@ -1,0 +1,55 @@
+#video-workflow[hidden]{display:none}
+.video-active .export-layout{flex:none;display:block;height:auto;min-height:0}
+.video-active .export-settings{height:auto;overflow:visible}
+.video-active .export-settings>.field:first-child{margin:0 0 8px auto;max-width:220px}
+.video-active #video-workflow{flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) 260px;grid-template-rows:minmax(160px,1fr) auto 38px;column-gap:22px;row-gap:12px;padding-top:4px;overflow:hidden}
+.video-preview{grid-column:1;grid-row:1;min-width:0;min-height:0;display:flex;align-items:center;justify-content:center;overflow:hidden;border-radius:10px;background:rgba(0,0,0,.12)}
+.video-preview img{max-width:100%;max-height:100%;object-fit:contain}
+.video-preview img:not([src]){visibility:hidden}
+.video-controls{grid-column:2;grid-row:1;display:flex;flex-direction:column;justify-content:flex-start;gap:12px;min-width:0;overflow:auto;padding:2px 4px 2px 0}
+.video-controls label{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:30px}
+.video-controls select{max-width:164px}
+.video-controls input{width:80px}
+.video-controls .combo{margin-left:auto;max-width:164px}
+.video-controls [hidden],.video-sequence[hidden]{display:none}
+.video-sequence{grid-column:1/-1;grid-row:2;min-height:0;overflow:hidden;padding-top:4px}
+.video-add{display:flex;gap:8px;align-items:center;min-height:34px}
+.video-add select,.video-add .combo{width:190px;max-width:190px}
+.video-add [data-key-name]{margin-left:auto;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.video-add [data-key-time]{width:66px}
+.video-timeline-scroll{overflow-x:auto;overflow-y:hidden;margin-top:10px;padding-bottom:6px}
+.video-timeline{height:126px;position:relative;touch-action:none;user-select:none}
+.video-ruler{height:25px;position:relative;border-bottom:1px solid var(--border,rgba(160,180,205,.2));margin-right:1px}
+.video-ruler span{position:absolute;top:0;font-size:10px;color:var(--text-muted,#9aaabd);font-variant-numeric:tabular-nums;transform:translateX(3px)}
+.video-ruler span::after{content:'';position:absolute;top:17px;left:-3px;height:7px;border-left:1px solid var(--border,rgba(160,180,205,.25))}
+.video-track{position:relative;height:96px;background:linear-gradient(transparent 44px,rgba(130,165,210,.15) 44px,rgba(130,165,210,.15) 46px,transparent 46px)}
+.video-key{position:absolute;top:12px;width:86px;height:72px;transform:translateX(-1px);padding:3px!important;display:flex;flex-direction:column;align-items:stretch;gap:3px;border:1px solid transparent!important;border-radius:7px;background:rgba(115,146,186,.15);cursor:grab;touch-action:none;overflow:hidden}
+.video-key.selected{border-color:var(--accent,#8bb9ef)!important;background:rgba(111,166,230,.25)}
+.video-key:active{cursor:grabbing}
+.video-key img{height:44px;width:100%;object-fit:cover;border-radius:4px;pointer-events:none}
+.video-key span{font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;pointer-events:none;text-align:left;padding:0 3px}
+.video-playhead{position:absolute;top:18px;bottom:2px;width:1px;background:var(--accent,#8bb9ef);pointer-events:none;z-index:2}
+.video-playhead::before{content:'';position:absolute;top:-4px;left:-4px;width:9px;height:9px;transform:rotate(45deg);background:var(--accent,#8bb9ef)}
+.video-export-progress{grid-column:1/-1;grid-row:3;display:flex;gap:12px;align-items:center;min-width:0;height:14px}
+.video-export-progress[hidden]{display:none}
+.video-export-progress progress{flex:1;width:100%;min-width:0;height:6px;accent-color:var(--accent,#8bb9ef)}
+.video-export-progress output{font-size:11px;min-width:30px;font-variant-numeric:tabular-nums}
+.video-playback{grid-column:1;grid-row:3;display:flex;align-items:center;gap:12px;min-width:0}
+.video-playback input{flex:1;min-width:0}
+.video-playback output{font-variant-numeric:tabular-nums;white-space:nowrap;font-size:11px}
+.video-export{grid-column:2;grid-row:3;display:flex;justify-content:flex-end;align-items:center;gap:12px}
+.video-export output{margin-right:auto}
+@media(max-width:760px){
+ .video-active #video-workflow{display:flex;flex-direction:column;overflow:auto;padding-right:5px}
+ .video-preview{flex:none;min-height:180px;height:28vh}
+ .video-controls{flex:none;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));overflow:visible;gap:10px 16px}
+ .video-controls label{min-width:0}
+ .video-controls select,.video-controls .combo{max-width:128px}
+ .video-sequence{flex:none;max-height:none}
+ .video-playback,.video-export{flex:none;min-height:38px}
+}
+
+.video-active #cancel-export{display:none}
+
+.video-active #video-workflow:has(.video-export-progress:not([hidden])){grid-template-rows:minmax(160px,1fr) auto 14px 38px}
+#video-workflow:has(.video-export-progress:not([hidden])) .video-playback,#video-workflow:has(.video-export-progress:not([hidden])) .video-export{grid-row:4}

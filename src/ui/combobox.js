@@ -102,6 +102,7 @@ export function enhanceSelects(doc, onLayout = () => {}) {
   }
   function sync() {
     for (const select of doc.querySelectorAll('select')) {
+      if (select.dataset.customCombo) continue;
       if (!controls.has(select)) {
         const wrapper = doc.createElement('span'); wrapper.className = 'combo';
         const button = doc.createElement('button'); button.type='button'; button.className='combo-trigger';
@@ -136,5 +137,8 @@ export function enhanceSelects(doc, onLayout = () => {}) {
   sync();
   const observer = new win.MutationObserver(sync);
   observer.observe(doc.body,{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['disabled','selected','hidden']});
-  return {sync,close};
+  function containsOwnedPopup(target, owner) {
+    return !!(active && owner?.contains(active.select) && active.menu.contains(target));
+  }
+  return {sync,close,containsOwnedPopup};
 }

@@ -22,6 +22,6 @@ export function nativePanPixels(payload, devicePixelRatio) {
 }
 
 export function resetCameraParameters(parameters, fields) {
-  for (const key of ['cameraYaw', 'cameraPitch', 'cameraDistance', 'fieldOfView', 'projection']) parameters[key] = fields[key].value;
+  for (const key of ['cameraYaw', 'cameraPitch', 'cameraDistance', 'fieldOfView', 'projection', 'cameraFrameX', 'cameraFrameY']) parameters[key] = fields[key].value;
   parameters.cameraPan = [0, 0, 0];
 }

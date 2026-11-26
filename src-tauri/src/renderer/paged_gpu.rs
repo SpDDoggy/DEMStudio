@@ -138,15 +138,30 @@ impl GpuTimers {
 
 const COMMIT: &str = "#version 330 compatibility\nuniform sampler2DArray state_image;void main(){gl_FragColor=texelFetch(state_image,ivec3(ivec2(gl_FragCoord.xy),6),0);}";
 
+
+
+pub(super) fn commit_source(batch: bool) -> String {
+    if batch {
+        COMMIT.replace("uniform sampler2DArray", &format!(
+            "#extension GL_ARB_shader_storage_buffer_object : require\n#extension GL_ARB_shader_image_load_store : require\n{}\nuniform sampler2DArray",
+            crate::renderer::gpu_batch::COMMIT_HEADER,
+        )).replace("void main(){", "void main(){if(!rs_batch_commit_ready())discard;")
+    } else { COMMIT.into() }
+}
+
+
 #[derive(PartialEq)]
 struct CoarseKey {
     path: std::path::PathBuf,
     modified: std::time::SystemTime,
     bytes: u64,
     dimensions: [u32; 2],
+    geo_halo: u32,
     range: [u64; 2],
     nodata: Option<u64>,
     factor: u32,
+    refinement: u32,
+    smooth_reconstruction: bool,
     curve: u32,
 }
 pub(super) struct CoarseCache {
@@ -158,6 +173,12 @@ pub(super) struct CoarseCache {
 }
 
 pub struct PagedExport {
+    policy: crate::renderer::source_export_policy::SourceExportPolicy,
+
+
+
+
+
     source: PagedSource,
     compact: Option<crate::renderer::compact_feedback::CompactFeedback>,
     scheduler: crate::renderer::page_scheduler::DemandScheduler,
@@ -183,6 +204,10 @@ pub struct PagedExport {
     raystate: bool,
     compute: bool,
     image_integrator: bool,
+    compute_image_mode:Option<crate::renderer::compute_image_layout::Mode>,
+    compute_image_st:Option<crate::renderer::compute_image_layout::StCapture>,
+    compute_image_st_ready:bool,
+    compute_image_st_captures:u64,
     interpolate: Option<glow::Program>,
     execution_steps: u32,
     max_batch_wait_seconds: f64,
@@ -224,13 +249,13 @@ pub struct PagedExport {
     ancestor_seed_preparation_cpu_seconds:f64,
     directional_skip:Option<crate::renderer::directional_skip::DirectionalSkip>,
     directional_skip_preparation_cpu_seconds:f64,
-    
-    
-    
-    
-    
-    
-    
+
+
+
+
+
+
+
     query_only_reserved_bytes:u64,
     bicubic_bounds: bool,
     low: glow::Texture,
@@ -291,6 +316,7 @@ impl ExportStats {
 // GlobalMemoryStatusEx is available on the existing Windows baseline. No
 // dependency or disk caching is introduced. Unknown memory uses bounded paging.
 fn source_resident_budget() -> usize {
+
     #[repr(C)]
     struct Memory { length: u32, load: u32, total: u64, available: u64,
         total_page: u64, available_page: u64, total_virtual: u64, available_virtual: u64, extended: u64 }
@@ -300,7 +326,14 @@ fn source_resident_budget() -> usize {
         total: 0, available: 0, total_page: 0, available_page: 0,
         total_virtual: 0, available_virtual: 0, extended: 0 };
     if unsafe { GlobalMemoryStatusEx(&mut info) } == 0 { return 0; }
-    (info.available / 4).min(2 * 1024 * 1024 * 1024) as usize
+    source_resident_budget_for(info.available)
+}
+
+fn source_resident_budget_for(available: u64) -> usize {
+    // Source-sized f32 grids can narrowly exceed 2 GiB even for compressed
+    // inputs around 200 MB. Retain them when RAM permits instead of repeatedly
+    // decoding the same TIFF pages; keep the existing available-memory share.
+    (available / 4).min(8 * 1024 * 1024 * 1024) as usize
 }
 
 fn cancelled(cancel: &AtomicBool) -> Result<(), String> {
@@ -311,7 +344,7 @@ fn cancelled(cancel: &AtomicBool) -> Result<(), String> {
     }
 }
 
-// Five halo R32F levels per slot. Keep at least three quarters of currently
+// Five halo R32F levels per slot. Keep at least half of currently
 // available VRAM outside the height cache for state/output/driver/desktop.
 const PAGE_BYTES: u64 = (640*640 + 320*320 + 160*160 + 80*80 + 40*40) * 4;
 fn page_cache_slots(pages: u64, layers: u32, available: u64, requested_mib: Option<u64>) -> usize {
@@ -321,9 +354,9 @@ fn page_cache_slots_with_bounds(pages:u64,layers:u32,available:u64,requested_mib
     page_cache_slots_with_extra(pages,layers,available,requested_mib,if tight{crate::renderer::tight_bounds::LOW_BYTES}else{0},fixed)
 }
 fn page_cache_slots_with_extra(pages:u64,layers:u32,available:u64,requested_mib:Option<u64>,extra:u64,fixed:u64)->usize {
-    let default_budget = if available == 0 { 256*1024*1024 } else { (available/4).min(1024*1024*1024) };
+    let default_budget = if available == 0 { 256*1024*1024 } else { (available/2).min(4*1024*1024*1024) };
     let budget = requested_mib.and_then(|v|v.checked_mul(1024*1024)).unwrap_or(default_budget);
-    let budget = if available == 0 { budget.min(256*1024*1024) } else { budget.min(available/4) };
+    let budget = if available == 0 { budget.min(256*1024*1024) } else { budget.min(available/2) };
     (budget.saturating_sub(fixed)/(PAGE_BYTES+extra)).max(1).min(pages.max(1)).min(u64::from(layers.max(1))) as usize
 }
 
@@ -353,6 +386,40 @@ impl GlRenderer {
     ) -> Result<PagedExport, String> {
         let started = std::time::Instant::now();
         cancelled(cancel)?;
+        let version=self.gl.version();
+        let image_policy=std::env::var("DEMSTUDIO_INTEGRATOR").as_deref()!=Ok("replay")
+            &&(version.major,version.minor)>=(4,3)
+            &&std::env::var("DEMSTUDIO_RAYSTATE").unwrap_or_else(|_|"image".into())=="image";
+        let policy=crate::renderer::source_export_policy::SourceExportPolicy::resolve(
+            geo,desired.surface=="bilinear",factor==1&&desired.export_terrain_scale=="source",image_policy)?;
+
+
+
+
+
+
+
+        let compute_image_mode=match policy.execution(){
+            crate::renderer::source_export_policy::SourceExportExecution::Fragment=>None,
+            crate::renderer::source_export_policy::SourceExportExecution::Compute8x4=>Some(crate::renderer::compute_image_layout::Mode::Tile8x4),
+        };
+
+
+
+
+
+
+        if compute_image_mode.is_some(){
+            crate::renderer::compute_image_layout::validate_scope(geo,desired.surface=="bilinear",
+                factor==1&&desired.export_terrain_scale=="source",image_policy,false)?;
+        }
+
+
+
+
+
+
+
         let original = preview.source.as_ref().ok_or("源精度导出缺少原始文件")?;
         let mut source = PagedSource::open_for_map_with_progress(
             preview,
@@ -362,6 +429,10 @@ impl GlRenderer {
             512 * 1024 * 1024,
             |_, _| cancelled(cancel),
         )?;
+        source.set_tight_bounds(policy.tight_bounds);
+
+
+        if crate::renderer::bilinear_refine::active(desired){source.set_refinement(2)?;}
         if [source.metadata().width, source.metadata().height] != [original.width, original.height]
         {
             return Err("源文件尺寸已改变，请重新导入".into());
@@ -380,9 +451,12 @@ impl GlRenderer {
             modified: file.modified().map_err(|e| e.to_string())?,
             bytes: file.len(),
             dimensions: [source.metadata().width, source.metadata().height],
+            geo_halo: source.geo_halo,
             range: source.metadata().elevation_range.map(f64::to_bits),
             nodata: source.metadata().nodata.map(f64::to_bits),
             factor,
+            refinement: source.refinement(),
+            smooth_reconstruction: crate::renderer::bilinear_refine::bspline_enabled(),
             curve: effective_height_curve(desired).to_bits(),
         };
         source.set_resident_budget(source_resident_budget());
@@ -425,7 +499,7 @@ impl GlRenderer {
             return Err("IntegrationWork需要WalkProfile=on与AsyncSamples=on".into());
         }
         if leaf_enabled&&desired.surface!="bicubic" {return Err("叶界候选仅支持 Bicubic".into());}
-        let tight_enabled=std::env::var("DEMSTUDIO_TIGHT_BOUNDS").as_deref()==Ok("on");
+        let tight_enabled=policy.tight_bounds;
         let geo_merged_enabled=std::env::var("DEMSTUDIO_GEO_MERGED").as_deref()==Ok("on");
         let query_only_enabled=std::env::var("DEMSTUDIO_QUERY_ONLY").as_deref()==Ok("on");
         if query_only_enabled&&(!cfg!(test)||!geo||!["bilinear","bicubic"].contains(&desired.surface.as_str())
@@ -520,25 +594,35 @@ impl GlRenderer {
                 return Err("BicubicPatchGather仅支持image raystate且禁用PhaseCompute".into());
             }
             if row_enabled&&(!image_integrator||std::env::var("DEMSTUDIO_PHASE_COMPUTE").as_deref()==Ok("on")){return Err("Bicubic行缓存仅支持image raystate且禁用PhaseCompute".into());}
-            if std::env::var("DEMSTUDIO_BILINEAR_LEAF_GATHER").as_deref()==Ok("on")&&(!(image_integrator||diagnostic_compute)||desired.surface!="bilinear"||std::env::var("DEMSTUDIO_PHASE_COMPUTE").as_deref()==Ok("on")){
+            if policy.leaf_gather&&(!(image_integrator||diagnostic_compute)||desired.surface!="bilinear"||std::env::var("DEMSTUDIO_PHASE_COMPUTE").as_deref()==Ok("on")){
                 return Err("LeafGather仅支持Bilinear image且禁用PhaseCompute".into());
             }
             if leaf_enabled&&!image_integrator{return Err("Bicubic叶界候选仅支持image raystate积分器".into());}
             if query_only_enabled&&(!raystate||!image_integrator){return Err("QueryOnly requires original image RayState".into());}
             ;
             ;
-            
+
             if primary_sun_cert_enabled&&(!raystate||!image_integrator||!self.gl.supported_extensions().contains("GL_ARB_gpu_shader_fp64")||self.gl.get_parameter_i32(glow::MAX_TEXTURE_IMAGE_UNITS)<12){return Err("PrimarySunCert requires image RayState, FP64 and 12 samplers".into());}
             if directional_skip_enabled&&(!raystate||!image_integrator){return Err("DCSF requires image RayState".into());}
             if directional_skip_enabled&&(self.gl.get_parameter_i32(glow::MAX_TEXTURE_IMAGE_UNITS)<12||self.gl.get_parameter_i32(glow::MAX_COMBINED_TEXTURE_IMAGE_UNITS)<12||self.gl.get_parameter_i32(glow::MAX_COMPUTE_TEXTURE_IMAGE_UNITS)<6||self.gl.get_parameter_i32(glow::MAX_IMAGE_UNITS)<2){return Err("DCSF requires 12 fragment samplers and compute/image1".into());}
             let compute=raystate && (version.major,version.minor)>=(4,3)
                 && requested_raystate=="compute";
             let path = if compute {compute_program(&self.gl,&crate::renderer::raystate_shader::source_compute(&path_source(desired,geo))?)?}
-                else if image_integrator {program_with_vertex(&self.gl,
-                    if std::env::var("DEMSTUDIO_ACTIVE_QUEUE").as_deref()==Ok("off") {VERT}else{crate::renderer::raystate_shader::IMAGE_QUEUE_VERTEX},
-                    &{let source=crate::renderer::raystate_shader::source_image_fragment(&path_source(desired,geo))?;let source=if directional_skip_enabled{crate::renderer::directional_skip::transform(&source)?}else{source};
-                    
-                    source}).map_err(|error|if query_only_enabled{format!("QueryOnly integration: {error}")}else{error})?}
+                else if image_integrator {
+                    let source={let source=crate::renderer::raystate_shader::source_image_fragment_with_policy(&path_source(desired,geo),policy)?;let source=if directional_skip_enabled{crate::renderer::directional_skip::transform(&source)?}else{source};
+
+                    source};
+
+
+
+
+
+
+
+                    let layout_program=compute_image_mode.map(|mode|crate::renderer::compute_image_layout::build(&self.gl,&source,mode)).transpose()?;
+                    match layout_program{Some(program)=>program,None=>program_with_vertex(&self.gl,
+                        if std::env::var("DEMSTUDIO_ACTIVE_QUEUE").as_deref()==Ok("off") {VERT}else{crate::renderer::raystate_shader::IMAGE_QUEUE_VERTEX},
+                        &source).map_err(|error|if query_only_enabled{format!("QueryOnly integration: {error}")}else{error})?}}
                 else {program(&self.gl,&if raystate {crate::renderer::raystate_shader::source_with_mrt(&path_source(desired,geo),wide_mrt)?}
                 else {crate::renderer::paged_shader::source_with_mrt(&path_source(desired,geo),wide_mrt)?})?};
             programs.push(path);
@@ -551,7 +635,7 @@ impl GlRenderer {
                     return Err("独立像素采样需要地理图像积分器，且不能同时启用阶段队列".into());
                 }
                 let source=if async_active_queue_enabled{if async_packed_queue{crate::renderer::async_active_queue::packed_fragment_source(&path_source(desired,geo))?}else{crate::renderer::async_active_queue::fragment_source(&path_source(desired,geo))?}}else{crate::renderer::raystate_shader::source_async_samples(&path_source(desired,geo))?};
-                
+
                 let p=program_with_vertex(&self.gl,crate::renderer::raystate_shader::IMAGE_QUEUE_VERTEX,&source)?;
                 programs.push(p);Some(p)
             }else{None};
@@ -582,7 +666,7 @@ impl GlRenderer {
                 let p=program(&self.gl,crate::renderer::raystate_shader::INTERPOLATED_ST_FRAGMENT)?;
                 programs.push(p);Some(p)
             }else{None};
-            let commit_source=if image_integrator||(compute&&crate::renderer::raystate_shader::compute_batch_enabled()) {COMMIT.replace("uniform sampler2DArray",&format!("#extension GL_ARB_shader_storage_buffer_object : require\n{}\nuniform sampler2DArray",crate::renderer::gpu_batch::COMMIT_HEADER)).replace("void main(){","void main(){if(!rs_batch_commit_ready())discard;")}else{COMMIT.into()};
+            let commit_source=commit_source(image_integrator||(compute&&crate::renderer::raystate_shader::compute_batch_enabled()));
             let commit = program(&self.gl, &commit_source)?;
             programs.push(commit);
             for _ in 0..7 {
@@ -615,13 +699,24 @@ impl GlRenderer {
             let mut tight_low=if tight_enabled{let t=self.gl.create_texture()?;textures.push(t);Some(t)}else{None};
             let tight_coarse=if tight_enabled{let t=self.gl.create_texture()?;textures.push(t);Some(t)}else{None};
             let tight_coarse_bytes=cache.tight_levels.as_ref().filter(|_|tight_enabled).map_or(0,|v|v.iter().map(|l|l.values.len() as u64*4).sum());
-            
+
             #[cfg(not(test))] let query_only_bytes=0u64;
-            
-            
+
+
             #[cfg(not(test))] let root_capture_bytes=0u64;
-            
+
             #[cfg(not(test))] let root_only_cost_bytes=0u64;
+            let compute_image_bytes=if compute_image_mode.is_some(){65536u64*8}else{0};
+
+            #[cfg(not(test))] let suffix_oracle_bytes=0u64;
+
+            #[cfg(not(test))] let late_oracle_bytes=0u64;
+
+            #[cfg(not(test))] let bracket_oracle_bytes=0u64;
+
+            #[cfg(not(test))] let lookahead_oracle_bytes=0u64;
+
+            #[cfg(not(test))] let walker_oracle_bytes=0u64;
             let primary_sun_cert_bytes=if primary_sun_cert_enabled{65536u64*16}else{0};
             let directional_skip_bytes=if directional_skip_enabled{crate::renderer::directional_skip::memory_bytes(source.padded_size).ok_or("DCSF budget invalid")?}else{0};
             let geo_merged_coarse_bytes=if geo_merged_enabled{crate::renderer::geo_merged::coarse_bytes(source.padded_size).ok_or("Geo合并粗层预算无效")?}else{0};
@@ -638,7 +733,7 @@ impl GlRenderer {
             }
             // Geographic traversal has a two-cell logical border. Keep raw
             // mips if that border would exceed the existing coarse allocation.
-            let bicubic_bounds=crate::renderer::bicubic_bounds::enabled(&desired.surface)
+            let bicubic_bounds=path_source(desired,geo).contains("#define PRIM_BICUBIC") && crate::renderer::bicubic_bounds::enabled(&desired.surface)
                 &&source.logical_size.iter().all(|&n|n.saturating_add(2)<=source.padded_size);
             let bound_preparation_cpu_seconds=upload_levels(&self.gl, coarse, &cache.levels, 5,
                 if bicubic_bounds{Some((source.logical_size,u32::from(geo)))}else{None}, &mut preparation_timers);
@@ -649,7 +744,7 @@ impl GlRenderer {
             // D-053: bounded page cache, one paged integrator.
             let mut residency_reason = "unified_paged_budget";
             let mut slots = page_cache_slots_with_extra(pages, gpu_layer_limit, available_gpu_bytes,
-                std::env::var("DEMSTUDIO_PAGE_CACHE_MIB").ok().and_then(|v|v.parse().ok()),if tight_enabled{crate::renderer::tight_bounds::LOW_BYTES}else{0}+if leaf_enabled{crate::renderer::bicubic_leaf::SLOT_BYTES}else{0}+if geo_merged_enabled{crate::renderer::geo_merged::LOW_BYTES}else{0}+if ancestor_seed_enabled{crate::renderer::ancestor_seed::SLOT_BYTES}else{0}+if row_enabled{crate::renderer::bicubic_rows::SLOT_BYTES}else{0},tight_coarse_bytes+probe_bytes+wavefront_reserved_bytes+geo_merged_coarse_bytes+directional_skip_bytes+primary_sun_cert_bytes+query_only_bytes+root_capture_bytes+root_only_cost_bytes+if async_active_queue_enabled{crate::renderer::async_active_queue::BYTES}else{0}+if crate::renderer::walk_profile::enabled(){crate::renderer::walk_profile::diagnostic_bytes()}else{0});
+                std::env::var("DEMSTUDIO_PAGE_CACHE_MIB").ok().and_then(|v|v.parse().ok()),if tight_enabled{crate::renderer::tight_bounds::LOW_BYTES}else{0}+if leaf_enabled{crate::renderer::bicubic_leaf::SLOT_BYTES}else{0}+if geo_merged_enabled{crate::renderer::geo_merged::LOW_BYTES}else{0}+if ancestor_seed_enabled{crate::renderer::ancestor_seed::SLOT_BYTES}else{0}+if row_enabled{crate::renderer::bicubic_rows::SLOT_BYTES}else{0},tight_coarse_bytes+probe_bytes+wavefront_reserved_bytes+geo_merged_coarse_bytes+directional_skip_bytes+primary_sun_cert_bytes+query_only_bytes+root_capture_bytes+root_only_cost_bytes+suffix_oracle_bytes+late_oracle_bytes+bracket_oracle_bytes+lookahead_oracle_bytes+walker_oracle_bytes+compute_image_bytes+if async_active_queue_enabled{crate::renderer::async_active_queue::BYTES}else{0}+if crate::renderer::walk_profile::enabled(){crate::renderer::walk_profile::diagnostic_bytes()}else{0});
             loop {
                 if allocate_page_cache(&self.gl, low, slots, false).is_ok()
                     && tight_low.is_none_or(|t|allocate_tight_page_cache(&self.gl,t,slots).is_ok())
@@ -673,9 +768,15 @@ impl GlRenderer {
             fbos.push(fbo);
             self.check("创建源分页导出")?;
             let mut export = PagedExport {
+                policy,
+
+
+
+
+
                 compact: None,
                 scheduler: crate::renderer::page_scheduler::DemandScheduler::new(4096,8),
-                prefetch: if std::env::var("DEMSTUDIO_PREFETCH").as_deref()==Ok("off") {None} else {
+                prefetch: if source.refinement()==2 || std::env::var("DEMSTUDIO_PREFETCH").as_deref()==Ok("off") {None} else {
                     crate::renderer::page_prefetch::PagePrefetch::new(&original.path,source.metadata().elevation_range,
                         factor,effective_height_curve(desired),u32::from(geo),source.resident_samples(),32*1024*1024)
                 },
@@ -689,6 +790,10 @@ impl GlRenderer {
                 raystate,
                 compute,
                 image_integrator,
+                compute_image_mode,
+                compute_image_st:None,
+                compute_image_st_ready:false,
+                compute_image_st_captures:0,
                 interpolate,
                 max_batch_wait_seconds: 0.,
                 bound_preparation_cpu_seconds,budget_gpu_observations:0,budget_wall_fallbacks:0,budget_async_wall_observations:0,max_batch_wall_seconds: 0.,boundary_done:0,boundary_waiting:0,boundary_active:0,boundary_capacity:0,
@@ -701,13 +806,13 @@ impl GlRenderer {
                 commit,
                 coarse,
                 tight_low,tight_coarse,tight_coarse_bytes,leaf_bounds,leaf_program,row_cache,row_program,row_transform:None,row_preparation_cpu_seconds,geo_merged:None,geo_merged_preparation_cpu_seconds:0.,ancestor_seed:None,ancestor_seed_preparation_cpu_seconds:0.,directional_skip:None,directional_skip_preparation_cpu_seconds:0.,
-                
-                
-                
-                
-                
-                
-                
+
+
+
+
+
+
+
                 query_only_reserved_bytes:query_only_bytes,
                 bicubic_bounds,
                 low,
@@ -735,7 +840,7 @@ impl GlRenderer {
                     "max_bounces":desired.max_bounces,"factor":factor,"geo":geo}),
                 bricks: VecDeque::new(),
             };
-            if (compute||image_integrator) && std::env::var("DEMSTUDIO_ACTIVE_QUEUE").as_deref()!=Ok("off") {
+            if compute_image_mode.is_none() && (compute||image_integrator) && std::env::var("DEMSTUDIO_ACTIVE_QUEUE").as_deref()!=Ok("off") {
                 export.active_queue=match crate::renderer::active_queue::ActiveQueue::create(&self.gl,65536){
                     Ok(queue)=>queue,Err(error)=>{export.timers.finish(&self.gl);return Err(error);}
                 };
@@ -818,7 +923,7 @@ impl GlRenderer {
             }
             if ancestor_seed_enabled{
                 let started=std::time::Instant::now();
-                
+
                 #[cfg(not(test))]
                 let created=crate::renderer::ancestor_seed::AncestorSeed::create(&self.gl,export.slots.len()as u32,export.source.padded_size);
                 export.ancestor_seed_preparation_cpu_seconds+=started.elapsed().as_secs_f64();
@@ -857,9 +962,14 @@ impl GlRenderer {
                     export.timers.finish(&self.gl);return Err(error);
                 }};
             }
-            
-            
-            
+
+
+
+
+
+
+
+
             export.checkpoint(&self.gl,"prepared",true);
             Ok(export)
         })();
@@ -883,6 +993,7 @@ impl GlRenderer {
                 span: size[0].max(size[1]) as f32 * 0.2,
                 source_elevation: source_elevation_range(preview),
                 source_size: [original.width, original.height],
+                numeric_height: numeric_height(preview),
             });
             self.padded = export.source.padded_size;
             self.levels = self.padded.ilog2();
@@ -897,13 +1008,18 @@ impl GlRenderer {
     }
 
     pub unsafe fn profile_source_output(&mut self, export: &mut PagedExport) -> Result<Vec<u8>, String> {
+
+
+
+
+
         let timer = export.timers.begin(&self.gl, GpuStage::Output);
         let result = self.export_pixels_for_output();
         export.timers.end(&self.gl, GpuStage::Output, timer);
         result
     }
 
-    
+
 
     pub unsafe fn end_source_export(&mut self, mut export: PagedExport) {
         export.timers.finish(&self.gl);
@@ -974,12 +1090,43 @@ impl GlRenderer {
             "height_transform":export.row_transform,"quantized":export.row_transform.is_some()&&self.params.height_step>0.,"step_scope":"actual uniform when quantized; unused positive placeholder otherwise","preparation_cpu_seconds":export.row_preparation_cpu_seconds,
             "preparation_cpu_scope":"shader compilation, texture allocation and build command submission; GPU intervals are bicubic_rows_preparation"});
         report["bicubic_patch_gather"]=serde_json::json!({"enabled":std::env::var("DEMSTUDIO_BICUBIC_PATCH_GATHER").as_deref()==Ok("on"),"scope":"integer internal raw 4x4 footprint via four gathers; boundary fallback original bc_raw; original height transform and both Bezier conversions remain local","extra_gpu_memory_bytes":0});
-        report["bilinear_leaf_gather"]=serde_json::json!({"enabled":std::env::var("DEMSTUDIO_BILINEAR_LEAF_GATHER").as_deref()==Ok("on"),"scope":"LOD0 integer interior 2x2 raw footprint only; all other calls retain original four heightLod samples","extra_gpu_memory_bytes":0});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        report["source_export_policy"]=serde_json::json!({"profile":export.policy.profile,
+            "tight_bounds":export.policy.tight_bounds,"tight_descent":export.policy.tight_descent,
+            "leaf_gather":export.policy.leaf_gather,"phase_limit":export.policy.phase_limit,
+            "default_geo_acceleration":crate::renderer::source_export_policy::DEFAULT_GEO_ACCELERATION});
+        report["compute_image_layout"]=serde_json::json!({
+            "enabled":export.compute_image_mode.is_some(),"mode":export.compute_image_mode.map(|m|m.name()),
+            "local_shape":export.compute_image_mode.map(|m|m.local()),
+            "last_tile_size":export.size,"last_dispatch_shape":export.compute_image_mode.and_then(|m|m.shape(export.size).ok()),
+            "capture_count":export.compute_image_st_captures,
+            "gpu_memory_bytes":export.compute_image_st.as_ref().map_or(0,|s|s.memory_bytes()),
+            "reserved_gpu_memory_bytes":if export.compute_image_mode.is_some(){65536u64*8}else{0},
+            "active_queue_enabled":export.active_queue.is_some(),"active_queue_setting":std::env::var("DEMSTUDIO_ACTIVE_QUEUE").ok(),
+            "active_queue_disabled_by_execution":export.compute_image_mode.is_some(),
+            "state_io":"selected image integrator, mutable layers and DONE stores unchanged",
+            "commit":"independent original fixed-function ordered blend",
+            "capture_timing":"memo_copy once per tile before source integration; included in parent wall time",
+            "scope":"explicit source image-to-compute stage/layout, captured original VERT RG32F varying"});
+        report["bilinear_leaf_gather"]=serde_json::json!({"enabled":export.policy.leaf_gather,"scope":"LOD0 integer interior 2x2 raw footprint only; all other calls retain original four heightLod samples","extra_gpu_memory_bytes":0});
         report["bicubic_leaf_bounds"]=serde_json::json!({"enabled":export.leaf_bounds.is_some(),"extra_slot_bytes":if export.leaf_bounds.is_some(){crate::renderer::bicubic_leaf::SLOT_BYTES}else{0}});
-        
-        
+
+
         report["root_v2"]=serde_json::json!(std::env::var("DEMSTUDIO_BICUBIC_ROOT_V2").as_deref()==Ok("on"));
-        
+
         report["directional_skip"]=serde_json::json!({"enabled":export.directional_skip.is_some(),"gpu_memory_bytes":export.directional_skip.as_ref().map_or(0,|m|m.bytes()),"preparation_cpu_seconds":export.directional_skip_preparation_cpu_seconds,"gpu_preparation_stage":"directional_skip_preparation","scope":"Geo Bilinear shadow coarse LOD>=5 directional rectangle cached across original microsteps; no direct cursor jump or new page demand","default":"off"});
         report["ancestor_seed"]=serde_json::json!({"enabled":export.ancestor_seed.is_some(),"extra_slot_bytes":if export.ancestor_seed.is_some(){crate::renderer::ancestor_seed::SLOT_BYTES}else{0},"texture_unit":if export.ancestor_seed.is_some(){Some(if export.leaf_bounds.is_some(){12}else{10})}else{None},"with_leaf_bounds":export.ancestor_seed.is_some()&&export.leaf_bounds.is_some(),
             "gpu_memory_bytes":export.ancestor_seed.as_ref().map_or(0,|m|m.memory_bytes()),"preparation_cpu_seconds":export.ancestor_seed_preparation_cpu_seconds,
@@ -1030,8 +1177,8 @@ impl GlRenderer {
         report["bicubic_stack_variant"]=serde_json::json!(std::env::var("DEMSTUDIO_BICUBIC_STACK").unwrap_or_else(|_|"original".into()));
         report["bicubic_root_coefficient_rebuild"]=serde_json::json!({"enabled":std::env::var("DEMSTUDIO_BICUBIC_ROOT_REBUILD").as_deref()==Ok("on"),"scope":"isolator only; original monotone fast path and explicit ShadowAnyRoot candidate unchanged","dynamic_key_bytes":100,"removed_dynamic_coefficient_bytes":700,"production_split_counters":false,"rebuild_cost_bound":"extra split count E=sum(depth of popped right keys), <=24*R; no speed claim"});
         report["bicubic_root_dyadic_keys"]=serde_json::json!(std::env::var("DEMSTUDIO_BICUBIC_ROOT_KEYS").as_deref()==Ok("on")&&std::env::var("DEMSTUDIO_BICUBIC_STACK").as_deref()!=Ok("left"));
-        
-        
+
+
         report["state_layers"]=serde_json::json!(export.state_layers);
         report["primary_cache_enabled"]=serde_json::json!(true);
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -1047,10 +1194,15 @@ impl GlRenderer {
         if let Some(wavefront)=export.wavefront.take(){wavefront.destroy(&self.gl);}
         if let Some(batch)=export.batch.take(){batch.destroy(&self.gl);}
         if let Some(compact) = export.compact.take() { compact.destroy(&self.gl); }
-        
-        
-        
-        
+
+
+
+
+
+
+
+
+
         if let Some(m)=export.directional_skip.take(){m.destroy(&self.gl);}
         if let Some(m)=export.ancestor_seed.take(){m.destroy(&self.gl);}
         if let Some(m)=export.geo_merged.take(){m.destroy(&self.gl);}
@@ -1074,6 +1226,7 @@ impl GlRenderer {
         if let Some(q)=export.phase_queue.take(){q.destroy(&self.gl);}
         if let Some(samples)=export.async_samples.take(){samples.destroy(&self.gl);}
         if let Some(queue)=export.async_active_queue.take(){queue.destroy(&self.gl);}
+        if let Some(st)=export.compute_image_st.take(){st.destroy(&self.gl);}
         if let Some(pair)=export.async_fresh_pair.take(){for p in pair{self.gl.delete_program(p);}}
         if let Some(pair)=export.async_phase_pair.take(){for p in pair{self.gl.delete_program(p);}}
         if let Some(path)=export.async_path.take(){self.gl.delete_program(path);}
@@ -1091,12 +1244,13 @@ impl GlRenderer {
     ) -> Result<bool, String> {
         if self.count==0 {
             export.batch_steps=1;
-            
-            
-            
+            export.compute_image_st_ready=false;
+
+
+
         }
         self.source_pass(export, cancel, false)?;
-        
+
         export.batch_resume=false;
         export.stats.pixel_samples += u64::from(self.params.width) * u64::from(self.params.height);
         self.count += 1;
@@ -1104,7 +1258,7 @@ impl GlRenderer {
         Ok(true)
     }
 
-    
+
 
     pub unsafe fn finish_source_surface(
         &mut self,
@@ -1129,11 +1283,36 @@ impl GlRenderer {
         let prepared = self.prepare_sample();
         self.path = dense;
         prepared?;
+
+
+
+
         self.gl.use_program(Some(e.path));
-        
-        
+
+        if e.compute_image_mode.is_some(){
+            if e.compute_image_st.as_ref().map_or(true,|st|st.size()!=size){
+                if let Some(old)=e.compute_image_st.take(){old.destroy(&self.gl);}
+                e.compute_image_st=Some(crate::renderer::compute_image_layout::StCapture::create(&self.gl,size)?);
+                e.compute_image_st_ready=false;
+            }
+            let capture=e.compute_image_st.as_ref().unwrap();
+            if !e.compute_image_st_ready{
+                // Identical f32 expression to prepare_sample_program. The
+                // varying itself is still evaluated by the original VERT and
+                // rasterizer; this does not derive ST from pixel coordinates.
+                let(full,_)=output_tile_mapping(self.output_tile,size);let shortest=full[0].min(full[1]);
+                let timer=e.timers.begin(&self.gl,GpuStage::Memo);
+                let captured=capture.capture_values(&self.gl,[full[0]/shortest,full[1]/shortest],[0.,0.]);
+                e.timers.end(&self.gl,GpuStage::Memo,timer);captured?;
+                e.compute_image_st_ready=true;e.compute_image_st_captures+=1;
+            }
+            capture.bind(&self.gl,e.path);
+        }
+
+
         self.bind_tex(e.path, "tex_sky_model", 3, self.sky_tex);
-        self.i(e.path, "surface_pass", i32::from(surface));
+        self.i(e.path, "surface_pass", if surface {1} else {self.export_layer});
+        self.v2(e.path, "export_depth_range", self.export_depth);
         if surface {
             self.v2(e.path, "pixel_jitter", [0., 0.]);
         }
@@ -1144,8 +1323,11 @@ impl GlRenderer {
             e.source.logical_size[0] as i32,
             e.source.logical_size[1] as i32,
         );
-        let traversal_budget=256;
-        
+        // Source-aligned bilinear image paths keep a longer exact DDA prefix
+        // local. Other surfaces/backends retain their verified yield boundary.
+        let traversal_budget=if self.geo_tile.is_some()
+            && self.params.surface=="bilinear" && e.image_integrator {1024}else{256};
+
         self.i(e.path, "pg_iteration_budget", traversal_budget);
         self.i(e.path, "pg_precomputed_bounds", i32::from(e.bicubic_bounds));
         self.i(e.path, "pg_primary_cached", i32::from(self.geo_tile.is_some() && self.count > 0));
@@ -1163,7 +1345,7 @@ impl GlRenderer {
                 e.row_transform=Some([value[2],value[3],step]);
             }
         }
-        
+
         if let Some(m)=e.directional_skip.as_ref(){m.bind(&self.gl,e.path,true);}
         if let Some(m)=e.ancestor_seed.as_ref(){m.bind(&self.gl,e.path,if e.leaf_bounds.is_some(){12}else{10});}
         if let Some(m)=e.geo_merged.as_ref(){m.bind(&self.gl,e.path);}
@@ -1215,15 +1397,20 @@ impl GlRenderer {
             let timer=e.timers.begin(&self.gl,GpuStage::Integrate);
             self.gl.draw_arrays(glow::TRIANGLES,0,3);
             self.gl.memory_barrier(glow::FRAMEBUFFER_BARRIER_BIT|glow::SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
             e.timers.end(&self.gl,GpuStage::Integrate,timer);
             self.gl.use_program(Some(e.path));
         }
-        
+
         Ok(())
     }
 
     unsafe fn draw_source_image(&self,e:&PagedExport)->Result<(),String>{
-        
+        if let Some(mode)=e.compute_image_mode{
+            if !e.compute_image_st_ready||e.active_queue.is_some(){return Err("ComputeImageLayout捕获未就绪或稀疏队列未禁用".into());}
+            let shape=mode.shape(e.size)?;self.gl.dispatch_compute(shape[0],shape[1],shape[2]);return Ok(());
+        }
+
         self.gl.draw_arrays(glow::TRIANGLES,0,3);Ok(())
     }
 
@@ -1271,8 +1458,9 @@ impl GlRenderer {
                         self.i(e.path,"rs_use_point_queue",i32::from(resume&&sparse_queue&&e.active_queue.is_some()));
                         if let Some(queue)=e.active_queue.as_ref().filter(|_|resume&&sparse_queue){queue.draw(&self.gl,e.path,e.size)?;}
                         else{self.draw_source_image(e)?;}
-                        
+
                         #[cfg(not(test))] self.gl.memory_barrier(glow::SHADER_IMAGE_ACCESS_BARRIER_BIT|glow::TEXTURE_FETCH_BARRIER_BIT);
+
                     }
                     e.timers.end(&self.gl,GpuStage::Integrate,timer);
                     e.stats.draw_submission_seconds+=submitted.elapsed().as_secs_f64();
@@ -1293,6 +1481,7 @@ impl GlRenderer {
                     self.gl.bind_image_texture(0,Some(e.state[state]),0,true,0,glow::READ_WRITE,glow::RGBA32F);
                     self.gl.dispatch_compute((e.size[0]*e.size[1]).div_ceil(crate::renderer::raystate_shader::compute_group_size()),1,1);
                     self.gl.memory_barrier(glow::SHADER_IMAGE_ACCESS_BARRIER_BIT|glow::TEXTURE_FETCH_BARRIER_BIT|glow::TEXTURE_UPDATE_BARRIER_BIT);
+
                     }
                     e.timers.end(&self.gl,GpuStage::Integrate,timer);
                     e.stats.draw_submission_seconds+=submitted.elapsed().as_secs_f64();e.stats.draws+=u64::from(e.execution_steps);
@@ -1824,21 +2013,3 @@ fn inspect_status(status: &[f32]) -> Result<DispatchDecision, String> {
         pages: pages.into_iter().map(|(page, _)| page).collect(),
     })
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

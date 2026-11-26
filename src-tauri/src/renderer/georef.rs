@@ -515,5 +515,3 @@ fn keys_from_wkt(wkt: &str) -> Vec<u16> {
     }
     vec![]
 }
-
-

@@ -747,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "demstudio"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "flate2",
  "glow",
@@ -1809,6 +1809,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
